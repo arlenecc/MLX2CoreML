@@ -59,6 +59,12 @@ class _SlotStaticLayer(StaticLayer):
     def update(self, key_states, value_states, *args, **kwargs):
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
+        # 从合并 kv buffer 现算本层 K/V 视图：in-place scatter_ 写落回基 buffer
+        # （coremltools 按基 buffer 名映射为单个 Core ML State）。必须在 update
+        # 内现算切片——预先算好存成属性的视图会被 torch.export 当作常量，对其
+        # 做 in-place 写会报 "Constant ... is mutated ... register it as buffer"。
+        keys = self._base_kv[self._kv_slot, 0:1]
+        values = self._base_kv[self._kv_slot, 1:2]
         kv_length = key_states.shape[-2]
         cache_position = torch.arange(kv_length, device=self.device) + self.cumulative_length
         cache_position = cache_position.clamp(0, self.max_cache_len - 1)
@@ -69,16 +75,16 @@ class _SlotStaticLayer(StaticLayer):
         # 会退化为运行时 shape 张量，输出全符号形状（丢失静态维度导致断言失败）。
         idx = cache_position.unsqueeze(0).unsqueeze(1).unsqueeze(-1)
         idx = torch.zeros_like(key_states, dtype=idx.dtype) + idx
-        kv_dtype = self.keys.dtype
+        kv_dtype = keys.dtype
         try:
-            self.keys.scatter_(2, idx, key_states.to(kv_dtype))
-            self.values.scatter_(2, idx, value_states.to(kv_dtype))
+            keys.scatter_(2, idx, key_states.to(kv_dtype))
+            values.scatter_(2, idx, value_states.to(kv_dtype))
         except NotImplementedError:
             # MPS 等后端 scatter_/index_copy_ 不可用时的回退
-            self.keys[:, :, cache_position] = key_states.to(kv_dtype)
-            self.values[:, :, cache_position] = value_states.to(kv_dtype)
+            keys[:, :, cache_position] = key_states.to(kv_dtype)
+            values[:, :, cache_position] = value_states.to(kv_dtype)
         # 注意力消费方与 key_states 同精度（eager fp32 / 导出后统一 fp16）
-        return self.keys.to(key_states.dtype), self.values.to(value_states.dtype)
+        return keys.to(key_states.dtype), values.to(value_states.dtype)
 
 
 def _qwen35_gdn_forward(self, hidden_states, cache_params, attention_mask=None, **kwargs):
@@ -141,6 +147,14 @@ def _qwen35_gdn_forward(self, hidden_states, cache_params, attention_mask=None, 
     kernel = self.conv_kernel_size
     if cache_params is not None:
         layer_cache = cache_params.layers[self.layer_idx]
+        # 从合并 state buffer 现算本层 conv/rec 切片视图（预存视图会被 torch.export
+        # 当常量，必须 forward 内现算；后续 copy_ in-place 写落回基 buffer）。
+        # recurrent_states[0] 同步刷新，供下方 initial_state 读取与
+        # update_recurrent_state 的 copy_ 写回共用同一切片。
+        layer_cache.conv_states[0] = layer_cache._conv_base[layer_cache._conv_slot:
+                                                            layer_cache._conv_slot + 1]
+        layer_cache.recurrent_states[0] = layer_cache._rec_base[layer_cache._rec_slot:
+                                                                layer_cache._rec_slot + 1]
         conv_buf = layer_cache.conv_states[0]  # (1, conv_dim, kernel)，fp32 buffer
         stream = mixed_qkv.to(conv_buf.dtype)
         cat_in = torch.cat([conv_buf, stream], dim=2)  # (1, conv_dim, kernel+seq)
@@ -371,25 +385,30 @@ class KvCacheWrapper(nn.Module):
         # full attention 层换成槽位写入层；linear attention 层保留原生
         # LinearAttentionLayer（state 槽位稍后重绑定为 wrapper buffer）
         new_layers = []
+        full_idx = []  # full attention 层索引（按序），作为合并 kv buffer 的 slot
         for i, layer in enumerate(cache.layers):
             if i in linear_idx and isinstance(layer, LinearAttentionCacheLayerMixin):
                 new_layers.append(layer)
             else:
                 new_layers.append(_SlotStaticLayer(max_cache_len=self.max_seq_len))
-                kv_shape = (1, self.num_kv_heads, self.max_seq_len, self.head_dim)
-                for suffix in ("k", "v"):
-                    name = f"cache_{i}_{suffix}"
-                    self.register_buffer(name, torch.zeros(kv_shape, dtype=self.buffer_dtype,
-                                                           device=param.device))
-                    self._state_names.append(name)
+                full_idx.append(i)
         cache.layers = new_layers
         cache.early_initialization(batch_size=1, num_heads=self.num_kv_heads,
                                    head_dim=self.head_dim, dtype=param.dtype,
                                    device=param.device)
-        for i, layer in enumerate(cache.layers):
-            if isinstance(layer, _SlotStaticLayer):
-                layer.keys = getattr(self, f"cache_{i}_k")
-                layer.values = getattr(self, f"cache_{i}_v")
+        # 全部 full-attn 层的 K/V 合并为单个 kv_all buffer，规避 ANE 的 state 数量
+        # 上限（实测每层独立 K/V 时，连同 GDN 的 conv/rec state 远超上限，ANE 执行
+        # 计划构建失败 -14）。层 slot 的 K/V 由 _SlotStaticLayer.update 在追踪期
+        # 现算切片 kv_all[slot, 0:1] / kv_all[slot, 1:2]（in-place 写落回基 buffer）。
+        if full_idx:
+            self.register_buffer("kv_all", torch.zeros(
+                (len(full_idx), 2, self.num_kv_heads, self.max_seq_len, self.head_dim),
+                dtype=self.buffer_dtype, device=param.device))
+            self._state_names.append("kv_all")
+            for slot, i in enumerate(full_idx):
+                layer = cache.layers[i]
+                layer._base_kv = self.kv_all
+                layer._kv_slot = slot
         self._cache = cache
 
         if self._hybrid:
@@ -421,21 +440,36 @@ class KvCacheWrapper(nn.Module):
                                       kernels_mod.torch_chunk_gated_delta_rule)
             mixer.forward = MethodType(_qwen35_gdn_forward, mixer)
 
-        for i, mixer in mixers.items():
-            kernel = int(mixer.conv_kernel_size)
-            conv_dim = int(mixer.key_dim) * 2 + int(mixer.value_dim)
-            rec_shape = (1, int(mixer.num_v_heads),
-                         int(mixer.head_k_dim), int(mixer.head_v_dim))
+        # 全部 GDN 层的 conv/rec state 各合并为单个大 buffer（与 kv_all 同理：
+        # 规避 ANE 的 state 数量上限 -14）。层 slot 的视图在 _qwen35_gdn_forward
+        # 内现算并刷新到 conv_states[0]/recurrent_states[0]（in-place 写落回基
+        # buffer），此处只注入基 buffer 引用与 slot，不预存视图（会被 export 当常量）。
+        idx_list = sorted(mixers)
+        first = mixers[idx_list[0]]
+        kernel = int(first.conv_kernel_size)
+        conv_dim = int(first.key_dim) * 2 + int(first.value_dim)
+        rec_shape = (int(first.num_v_heads), int(first.head_k_dim), int(first.head_v_dim))
+        # qwen3_5 为均匀架构，合并前校验所有 GDN 层 state 形状一致
+        for i in idx_list:
+            mx = mixers[i]
+            if (int(mx.conv_kernel_size) != kernel
+                    or int(mx.key_dim) * 2 + int(mx.value_dim) != conv_dim
+                    or (int(mx.num_v_heads), int(mx.head_k_dim),
+                        int(mx.head_v_dim)) != rec_shape):
+                raise RuntimeError(f"第 {i} 层 GDN state 形状不一致，无法合并为共享 buffer")
+        self.register_buffer("conv_all", torch.zeros(
+            (len(idx_list), conv_dim, kernel), dtype=self.buffer_dtype, device=param.device))
+        self.register_buffer("rec_all", torch.zeros(
+            (len(idx_list),) + rec_shape, dtype=self.buffer_dtype, device=param.device))
+        self._state_names.extend(["conv_all", "rec_all"])
+        for slot, i in enumerate(idx_list):
             layer = self._cache.layers[i]
-            for suffix, shape in (("conv", (1, conv_dim, kernel)), ("rec", rec_shape)):
-                name = f"cache_{i}_{suffix}"
-                self.register_buffer(name, torch.zeros(shape, dtype=self.buffer_dtype,
-                                                       device=param.device))
-                self._state_names.append(name)
-            # state 槽位重绑定为 buffer，并标记已初始化/有历史（追踪期走既定分支，
-            # 不触发懒初始化；buffer 全零 = 全新会话语义）
-            layer.conv_states[0] = getattr(self, f"cache_{i}_conv")
-            layer.recurrent_states[0] = getattr(self, f"cache_{i}_rec")
+            layer._conv_base = self.conv_all
+            layer._conv_slot = slot
+            layer._rec_base = self.rec_all
+            layer._rec_slot = slot
+            # 标记已初始化/有历史（追踪期走既定分支，不触发懒初始化；
+            # buffer 全零 = 全新会话语义）
             layer.is_conv_states_initialized[0] = True
             layer.is_recurrent_states_initialized[0] = True
             layer.has_previous_state[0] = True

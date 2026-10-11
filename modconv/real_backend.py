@@ -22,11 +22,14 @@ from __future__ import annotations
 import gc
 import json
 import os
+import resource
 import shutil
+import sys
 import tempfile
+import threading
 import time
 import uuid
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Optional
@@ -138,6 +141,49 @@ func generateWithConvertedModel(modelURL: URL, promptTokens: [Int32],
     return generated
 }}
 '''
+
+
+class _Heartbeat:
+    """后台心跳线程：在长时间的阻塞阶段（torch.export 追踪 / coremltools 转换）
+    周期性向 UI 发"仍在运行"的日志，避免界面长时间无任何输出时用户误以为卡死。
+
+    在 worker 线程里启动一个 daemon 线程按间隔 log，阻塞的主任务返回后 stop()。
+    日志经由 hooks.on_log 发出的 Qt 信号，跨线程 emit 由 Qt 自动排队，安全。
+    with_memory=True 时附带进程内存峰值（MB），便于在冻结前发现内存吃满/swap。
+    """
+
+    def __init__(self, log, interval: float = 25.0,
+                 message: str = "仍在处理中，请稍候（大模型可能需数分钟，此阶段无进度条属正常）…",
+                 with_memory: bool = False):
+        self._log = log
+        self._interval = interval
+        self._message = message
+        self._with_memory = with_memory
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    @staticmethod
+    def _rss_mb() -> float:
+        # macOS 的 ru_maxrss 单位为字节，Linux 为 KB
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return rss / (1024 * 1024) if sys.platform == "darwin" else rss / 1024
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            msg = self._message
+            if self._with_memory:
+                try:
+                    msg = f"{msg}（内存峰值 {self._rss_mb():.0f} MB）"
+                except Exception:
+                    pass
+            self._log(msg)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
 
 
 def _import_heavy():
@@ -286,6 +332,35 @@ def _decomposition_table(libs):
     return table
 
 
+@contextmanager
+def _fail_fast_dynamo(libs):
+    """让 torch.export 追踪在陷入重追踪循环时快速失败，而不是盲 grind 几十分钟。
+
+    Dynamo 默认 recompile_limit=64：一旦模型里有触发反复重追踪的算子/守卫，
+    每次重追踪整模型要几十秒，撞满上限前界面会"卡死"数十分钟（0.8B 模型实测
+    可达 40 分钟）。这里把上限调到很小并打开 verbose，使其立刻抛出清晰错误
+    （含重追踪/图断裂原因），方便定位，而不是让用户无限等待。
+    """
+    torch = libs.torch
+    cfg = getattr(torch, "_dynamo", None)
+    cfg = getattr(cfg, "config", None) if cfg is not None else None
+    saved = {}
+    patched = False
+    if cfg is not None:
+        for key, val in (("recompile_limit", 4), ("error_on_recompile_limit", True),
+                         ("verbose", True)):
+            if hasattr(cfg, key):
+                saved[key] = getattr(cfg, key)
+                setattr(cfg, key, val)
+                patched = True
+    try:
+        yield
+    finally:
+        if patched:
+            for key, val in saved.items():
+                setattr(cfg, key, val)
+
+
 def _trace_torch_model(libs, model, max_seq_len: int):
     """包装为 KV cache 状态模块并 torch.export 导出，返回 (exported, wrapper)。
 
@@ -310,7 +385,7 @@ def _trace_torch_model(libs, model, max_seq_len: int):
     # scatter_ 变异会被 aot_export 拒绝（"graph input that requires gradients,
     # and received a mutation"）。桩 torch 没有 no_grad 时退化为空上下文。
     no_grad = getattr(torch, "no_grad", nullcontext)
-    with no_grad():
+    with no_grad(), _fail_fast_dynamo(libs):
         exported = torch.export.export(wrapper, example,
                                        dynamic_shapes=dynamic_shapes)
     return exported.run_decompositions(_decomposition_table(libs)), wrapper
@@ -508,17 +583,34 @@ class CoremltoolsBackend:
             if hooks.should_cancel():
                 return finish(False, True, "转换已取消", None, 0, 0)
 
-            stage("追踪 torch 计算图…")
-            exported, wrapper = _trace_torch_model(libs, model, max_seq_len)
+            stage("追踪 torch 计算图…（大模型可能需数分钟，此阶段无进度条属正常）")
+            heartbeat = _Heartbeat(hooks.on_log,
+                                   message="仍在追踪 torch 计算图，请稍候（Qwen3.5 混合架构较大，通常需数分钟）…")
+            heartbeat.start()
+            try:
+                exported, wrapper = _trace_torch_model(libs, model, max_seq_len)
+            finally:
+                heartbeat.stop()
             if hooks.should_cancel():
                 return finish(False, True, "转换已取消", None, 0, 0)
 
             stage("coremltools 转换为 Core ML 模型（大模型可能较慢）…")
-            mlmodel = _convert_to_coreml(libs, exported, wrapper)
-            # torch 侧大对象（模型权重 + 导出图）此后不再使用：coremltools 已持有
-            # fp16 权重副本，尽早释放并回收，显著降低量化/保存阶段的峰值内存
-            # （大模型可达数十 GB）。
-            del exported, wrapper, model
+            # 转换只需 exported/wrapper，原始 model（fp16 权重，0.8B 约 1.6GB）不再
+            # 使用：在转换前就释放并回收，砍掉转换期最大的一块内存，避免大模型在
+            # 转换期触发 swap 而显得"卡死"（coremltools 已持有自己的 fp16 权重副本）。
+            del model
+            gc.collect()
+            heartbeat = _Heartbeat(hooks.on_log,
+                                   message="仍在转换为 Core ML 模型，请稍候…",
+                                   with_memory=True)
+            heartbeat.start()
+            try:
+                mlmodel = _convert_to_coreml(libs, exported, wrapper)
+            finally:
+                heartbeat.stop()
+            # torch 侧剩余大对象（导出图 + wrapper）此后不再使用，尽早释放并回收，
+            # 显著降低后续量化/保存阶段的峰值内存（大模型可达数十 GB）。
+            del exported, wrapper
             gc.collect()
             if hooks.should_cancel():
                 return finish(False, True, "转换已取消", None, 0, 0)
@@ -526,8 +618,14 @@ class CoremltoolsBackend:
             # 权重压缩为 4-bit palettization；失败直接抛异常（禁止降级为全精度输出）
             quantized_bits = 0
             if self.quantize_nbits:
-                compressed = _compress_weights(libs, mlmodel, self.quantize_nbits,
-                                               hooks.on_log)
+                heartbeat = _Heartbeat(hooks.on_log,
+                                       message="仍在做权重量化（palettization），请稍候…")
+                heartbeat.start()
+                try:
+                    compressed = _compress_weights(libs, mlmodel, self.quantize_nbits,
+                                                   hooks.on_log)
+                finally:
+                    heartbeat.stop()
                 # 压缩前模型的临时权重目录（数十 GB 级）随旧对象一起释放
                 del mlmodel
                 gc.collect()
