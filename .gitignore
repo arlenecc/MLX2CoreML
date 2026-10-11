@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# 测试与工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 编辑器 / IDE
+.trae/
+.idea/
+.vscode/
+
+# 分发包构建产物（由 packaging/build_macos.py 生成，不入库）
+packaging/icon-preview-512.png
+*.dmg

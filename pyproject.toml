@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modconv"
+version = "0.1.0"
+description = "MLX → Core ML 模型转换工具（PyQt6 GUI）"
+requires-python = ">=3.10"
+dependencies = ["PyQt6>=6.6"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-qt>=4.4"]
+convert = ["torch>=2.2", "transformers>=4.44", "coremltools>=8.0", "safetensors>=0.4", "numpy",
+           # MLX 量化模型反量化需要（仅 macOS）
+           "mlx-lm>=0.25; platform_system=='Darwin'"]
+
+[project.scripts]
+modconv = "modconv.app:main"
+
+[tool.setuptools.packages.find]
+include = ["modconv*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+    # 第三方库的版本兼容噪音（torch 2.14 / coremltools 9 / transformers 5 组合）
+    "ignore::UserWarning:coremltools.*",
+    "ignore::Warning:coremltools.*",
+    "ignore::FutureWarning:torch.*",
+    "ignore::UserWarning:torch.*",
+    "ignore:.*torch.jit.trace.*:Warning",
+    "ignore::UserWarning:transformers.*",
+    "ignore::Warning:transformers.masking_utils.*",
+]
