@@ -18,3 +18,16 @@ def model_dir(tmp_path):
     (src / "meta" / "params.json").write_bytes(b"p" * 64)                # 64 B
     (src / "sub" / "model.safetensors").write_bytes(b"\0" * (1 << 20))   # 1 MiB
     return src
+
+
+@pytest.fixture
+def hf_model_dir(tmp_path):
+    """真实转换口径的模型目录：config.json 带受支持的 model_type + 权重。"""
+    import json
+
+    src = tmp_path / "hf-llm"
+    src.mkdir()
+    (src / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (src / "tokenizer.json").write_bytes(b"tok")
+    (src / "model.safetensors").write_bytes(b"\0" * (4 << 20))   # 4 MiB
+    return src

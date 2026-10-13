@@ -75,6 +75,9 @@ def _stub_libs():
         StateType=lambda wrapped_type, name: {"wrapped_type": wrapped_type, "name": name},
         precision=types.SimpleNamespace(FLOAT16="fp16"),
         target=types.SimpleNamespace(iOS18="ios18"),
+        ComputeUnit=types.SimpleNamespace(CPU_ONLY="cpuOnly",
+                                          ALL="all",
+                                          CPU_AND_NE="cpuAndNeuralEngine"),
     )
 
     class _FakeMLModel:
@@ -93,7 +96,7 @@ def _stub_libs():
 
     ct.convert = lambda traced, **kwargs: _FakeMLModel()
     ct.models = types.SimpleNamespace(
-        MLModel=lambda spec=None, weights_dir=None: _FakeMLModel(spec))
+        MLModel=lambda spec=None, weights_dir=None, compute_units=None: _FakeMLModel(spec))
     ct.optimize = types.SimpleNamespace(coreml=types.SimpleNamespace(
         palettize_weights=lambda model, config=None: model,
         OptimizationConfig=lambda global_config=None, op_name_configs=None:
@@ -352,6 +355,340 @@ def test_load_torch_model_falls_back_on_old_transformers(tmp_path):
 
 
 # --------------------------------------------------------------------- #
+# checkpoint 权重布局（MLX 多模态前缀 / Conv1d 转置）
+# --------------------------------------------------------------------- #
+
+def test_config_helpers_read_text_config():
+    """复合（多模态）配置的关键字段只在 text_config 上，读顶层会全部取到 None。"""
+    ns = types.SimpleNamespace
+    composite = ns(text_config=ns(layer_types=["linear_attention", "full_attention"],
+                                  num_hidden_layers=2))
+    assert real_backend_mod._min_max_seq_len(composite) == 2
+    assert real_backend_mod._rope_limit(
+        ns(text_config=ns(max_position_embeddings=4096))) == 4096
+    # 纯文本配置没有 text_config，照旧从顶层读
+    assert real_backend_mod._rope_limit(ns(max_position_embeddings=2048)) == 2048
+
+
+def test_resolve_weight_layout_accepts_plain_hf_layout():
+    """名字与形状都对得上：无需任何归一化。"""
+    want = {"model.embed_tokens.weight": (8, 4), "model.layers.0.q_proj.weight": (4, 4)}
+    assert real_backend_mod._resolve_weight_layout(want, dict(want)) == ("", set())
+
+
+def test_resolve_weight_layout_detects_multimodal_prefix():
+    """多模态 checkpoint 把文本模型放在 language_model. 之下。"""
+    want = {"model.embed_tokens.weight": (8, 4), "model.layers.0.q_proj.weight": (4, 4)}
+    have = {f"language_model.{k}": v for k, v in want.items()}
+    have["vision_tower.patch.weight"] = (16, 16)
+    assert real_backend_mod._resolve_weight_layout(want, have) == ("language_model.", set())
+
+
+def test_resolve_weight_layout_detects_mlx_conv1d():
+    """MLX 的 Conv1d 权重是 (out, kernel, in)，PyTorch 是 (out, in, kernel)。"""
+    want = {"model.layers.0.linear_attn.conv1d.weight": (64, 1, 4),
+            "model.layers.0.linear_attn.in_proj_qkv.weight": (192, 16)}
+    have = {"model.layers.0.linear_attn.conv1d.weight": (64, 4, 1),
+            "model.layers.0.linear_attn.in_proj_qkv.weight": (192, 16)}
+    prefix, transposed = real_backend_mod._resolve_weight_layout(want, have)
+    assert prefix == ""
+    assert transposed == {"model.layers.0.linear_attn.conv1d.weight"}
+
+
+def test_resolve_weight_layout_rejects_unrelated_checkpoint():
+    """名字完全对不上：必须拦下，否则 transformers 会全部随机初始化。"""
+    want = {"model.layers.0.q_proj.weight": (4, 4)}
+    have = {"vision_tower.patch.weight": (4, 4), "language_model.foo": (4, 4)}
+    assert real_backend_mod._resolve_weight_layout(want, have) is None
+
+
+def test_write_text_checkpoint_normalizes_prefix_and_conv(tmp_path):
+    """归一化产物是可被 AutoModelForCausalLM 直接加载的纯文本 HF 布局。"""
+    import torch
+    from safetensors.torch import load_file, save_file
+
+    src = tmp_path / "src"
+    src.mkdir()
+    conv = torch.arange(8, dtype=torch.float32).reshape(2, 4, 1)  # MLX 布局
+    emb = torch.ones(3, 2)
+    save_file({"language_model.model.layers.0.linear_attn.conv1d.weight": conv,
+               "language_model.model.embed_tokens.weight": emb,
+               "vision_tower.patch_embed.proj.weight": torch.zeros(2, 2)},
+              str(src / "model.safetensors"), metadata={"format": "pt"})
+    (src / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}),
+                                     encoding="utf-8")
+
+    want = {"model.layers.0.linear_attn.conv1d.weight": (2, 1, 4),
+            "model.embed_tokens.weight": (3, 2)}
+    prefix, transposed = real_backend_mod._resolve_weight_layout(
+        want, real_backend_mod._checkpoint_tensor_shapes(src))
+    assert prefix == "language_model."
+    assert transposed == {"model.layers.0.linear_attn.conv1d.weight"}
+
+    dest = tmp_path / "hf"
+    real_backend_mod._write_text_checkpoint(src, dest, prefix, transposed, lambda m: None)
+    out = load_file(str(dest / "model.safetensors"))
+    assert set(out) == set(want), "vision_tower 必须被丢弃"
+    assert tuple(out["model.layers.0.linear_attn.conv1d.weight"].shape) == (2, 1, 4)
+    # 转置只换轴，值一一对应
+    assert torch.equal(out["model.layers.0.linear_attn.conv1d.weight"].flatten(),
+                       conv.flatten())
+    assert torch.equal(out["model.embed_tokens.weight"], emb)
+    assert json.loads((dest / "config.json").read_text())["model_type"] == "qwen3_5"
+
+
+def test_coreml_cast_noise_filter_drops_precision_warning():
+    """索引常量的 int64→int32 降级告警要过滤掉（大模型下会刷满日志）。"""
+    import logging
+
+    filt = real_backend_mod._CoremlCastNoiseFilter()
+    noise = logging.LogRecord("coremltools", logging.WARNING, __file__, 1,
+                              "Saving value type of int64 into a builtin type of "
+                              "int32, might lose precision!", None, None)
+    keep = logging.LogRecord("coremltools", logging.WARNING, __file__, 1,
+                             "unsupported op", None, None)
+    assert filt.filter(noise) is False
+    assert filt.filter(keep) is True
+
+
+def test_unusable_model_message_detects_ane_failure():
+    """coremltools 用一条 RuntimeWarning 报告"模型跑不起来"，必须从告警里认出来。"""
+    caught = [types.SimpleNamespace(message="some other warning")]
+    assert real_backend_mod._unusable_model_message(caught) is None
+    caught.append(types.SimpleNamespace(
+        message="You will not be able to run predict() on this Core ML model. "
+                "error code: -14."))
+    assert "-14" in real_backend_mod._unusable_model_message(caught)
+
+
+def test_run_reports_failure_when_coreml_cannot_build_plan(tmp_path, monkeypatch):
+    """ANE 执行计划构建失败（-14）不能报"转换完成"——那是跑不起来的模型。"""
+    import warnings
+
+    src = _write_config(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    libs = _stub_libs()
+    orig_factory = libs.ct.models.MLModel
+    monkeypatch.setattr(real_backend_mod, "_import_heavy", lambda: libs)
+    monkeypatch.setattr(real_backend_mod, "_build_kv_wrapper",
+                        lambda model, max_seq: _StubKVWrapper())
+
+    def _warn_factory(spec=None, weights_dir=None, compute_units=None):
+        warnings.warn("You will not be able to run predict() on this Core ML "
+                      "model. error code: -14.", RuntimeWarning)
+        return orig_factory(spec)
+
+    libs.ct.models = types.SimpleNamespace(MLModel=_warn_factory)
+    hooks = RecordingHooks()
+    result = CoremltoolsBackend(src, out, max_seq_len=8).run(hooks)
+    assert result.success is False
+    assert result.cancelled is False
+    assert "执行计划" in result.message, result.message
+    # 产物已落盘便于排查，但要明确告知不可用
+    assert result.output_path == out / "m.mlpackage"
+
+
+def test_drop_package_removes_only_temp_packages(tmp_path, monkeypatch):
+    """临时 .mlpackage 必须删掉（GUI 长驻会堆积 GB 级），非临时的不能动。"""
+    import shutil
+
+    temp_dir = tmp_path / "temp.mlpackage"
+    temp_dir.mkdir()
+    (temp_dir / "f.bin").write_bytes(b"x")
+    kept_dir = tmp_path / "user.mlpackage"
+    kept_dir.mkdir()
+    (kept_dir / "f.bin").write_bytes(b"x")
+
+    ns = types.SimpleNamespace
+    real_backend_mod._drop_package(ns(is_temp_package=True,
+                                      package_path=str(temp_dir)))
+    assert not temp_dir.exists()
+
+    real_backend_mod._drop_package(ns(is_temp_package=False,
+                                      package_path=str(kept_dir)))
+    assert kept_dir.exists()
+    # 没有 package_path / 非模型对象都不能炸
+    real_backend_mod._drop_package(ns(is_temp_package=True))
+    real_backend_mod._drop_package(object())
+    real_backend_mod._drop_package(None)
+
+
+def test_capture_ane_warnings_only_keeps_target_warning():
+    """告警捕获只留"模型无法执行"：其它告警既不该吞也不该占用内存。"""
+    import warnings
+
+    with real_backend_mod._capture_ane_warnings() as caught:
+        warnings.warn("some unrelated numpy overflow", RuntimeWarning)
+        warnings.warn("You will not be able to run predict() on this Core ML "
+                      "model. error code: -14.", RuntimeWarning)
+    assert len(caught) == 1
+    assert "-14" in str(caught[0].message)
+    assert real_backend_mod._unusable_model_message(caught) is not None
+
+
+def test_run_reports_failure_without_output_name_when_only_one_plan(tmp_path, monkeypatch):
+    """非量化 + 长度已在下限 + ANE 失败：只有一个方案，也要干净报错而非 NameError。"""
+    import warnings
+
+    src = _write_config(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    libs = _stub_libs()
+    orig_convert = libs.ct.convert
+
+    def _convert(traced, **kwargs):
+        warnings.warn("You will not be able to run predict() on this Core ML "
+                      "model. error code: -14.", RuntimeWarning)
+        return orig_convert(traced, **kwargs)
+
+    libs.ct.convert = _convert
+    monkeypatch.setattr(real_backend_mod, "_import_heavy", lambda: libs)
+    monkeypatch.setattr(real_backend_mod, "_load_config",
+                        lambda s, l: types.SimpleNamespace(
+                            use_cache=True, max_position_embeddings=64))
+    monkeypatch.setattr(real_backend_mod, "_build_kv_wrapper",
+                        lambda model, max_seq: _StubKVWrapper())
+    hooks = RecordingHooks()
+    # quantize_nbits=None + max_seq_len=64：降级方案只有 1 个
+    result = CoremltoolsBackend(src, out, max_seq_len=64,
+                                quantize_nbits=None).run(hooks)
+    assert result.success is False
+    assert "执行计划" in result.message, result.message
+
+
+def test_run_retries_with_shorter_context_when_ane_fails(tmp_path, monkeypatch):
+    """-14 时自动降上下文重试：长度上限只能实测，不该让用户手动试长度。"""
+    """-14 时自动降上下文重试：长度上限只能实测，不该让用户手动试。"""
+    import warnings
+
+    src = _write_config(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    libs = _stub_libs()
+    orig_convert = libs.ct.convert
+    tried = []
+
+    def _convert(traced, **kwargs):
+        # 桩 state 形状 (1, 2, max_seq_len, head_dim)
+        seq = max(st["wrapped_type"]["shape"][-2] for st in kwargs["states"])
+        tried.append(seq)
+        if seq > 256:  # 长上下文的图 ANE 编译不过
+            warnings.warn("You will not be able to run predict() on this Core ML "
+                          "model. error code: -14.", RuntimeWarning)
+        return orig_convert(traced, **kwargs)
+
+    libs.ct.convert = _convert
+    monkeypatch.setattr(real_backend_mod, "_import_heavy", lambda: libs)
+    # 桩 config 的位置编码上限是 64，会把请求的 512 截掉：这里放开上限
+    monkeypatch.setattr(real_backend_mod, "_load_config",
+                        lambda s, l: types.SimpleNamespace(
+                            use_cache=True, max_position_embeddings=4096))
+
+    class _SeqWrapper:
+        def __init__(self, model, max_seq_len):
+            self.max_seq_len = int(max_seq_len)
+
+        def eval(self):
+            return self
+
+        def kv_state_specs(self):
+            return [("cache_0_k", (1, 2, self.max_seq_len, 4), "float32")]
+
+    monkeypatch.setattr(real_backend_mod, "_build_kv_wrapper",
+                        lambda model, max_seq: _SeqWrapper(model, max_seq))
+    hooks = RecordingHooks()
+    result = CoremltoolsBackend(src, out, max_seq_len=512).run(hooks)
+    assert result.success is True
+    assert tried == [512, 256], tried
+    assert any("降到 256" in m for m in hooks.logs), hooks.logs
+    # 最终模型说明里的长度必须是真正生效的那个
+    assert "1..256" in result.message, result.message
+
+
+def test_run_falls_back_to_unquantized_when_quantized_model_cannot_build_plan(
+        tmp_path, monkeypatch):
+    """量化后的图在 ANE 上构建不了执行计划时，退回未量化输出（体积大但能跑）。
+
+    实测：4-bit 图在 512/256/128 都报 -14，而未量化时这些长度都能过——所以长度
+    降到头之后，正确的兜底是放弃量化（而不是把上下文砍到 64 这种没法用的值）。
+    """
+    import warnings
+
+    src = _write_config(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    libs = _stub_libs()
+    orig_convert = libs.ct.convert
+    converted_seqs = []
+
+    def _convert(traced, **kwargs):
+        seq = max(st["wrapped_type"]["shape"][-2] for st in kwargs["states"])
+        converted_seqs.append(seq)
+        return orig_convert(traced, **kwargs)
+
+    libs.ct.convert = _convert
+    monkeypatch.setattr(real_backend_mod, "_import_heavy", lambda: libs)
+    monkeypatch.setattr(real_backend_mod, "_load_config",
+                        lambda s, l: types.SimpleNamespace(
+                            use_cache=True, max_position_embeddings=4096))
+    # 量化链条：只要做量化就 -14（长度降到下限后触发兜底）
+    compress_calls = []
+
+    def _compress(libs_, model, nbits, log):
+        compress_calls.append(nbits)
+        warnings.warn("You will not be able to run predict() on this Core ML "
+                      "model. error code: -14.", RuntimeWarning)
+        return model
+
+    monkeypatch.setattr(real_backend_mod, "_compress_weights", _compress)
+
+    class _SeqWrapper:
+        def __init__(self, model, max_seq_len):
+            self.max_seq_len = int(max_seq_len)
+
+        def eval(self):
+            return self
+
+        def kv_state_specs(self):
+            return [("cache_0_k", (1, 2, self.max_seq_len, 4), "float32")]
+
+    monkeypatch.setattr(real_backend_mod, "_build_kv_wrapper",
+                        lambda model, max_seq: _SeqWrapper(model, max_seq))
+    hooks = RecordingHooks()
+    result = CoremltoolsBackend(src, out, max_seq_len=512).run(hooks)
+    assert result.success is True
+    # 量化 512 → 量化 256（给量化一次缩短的机会）→ 未量化 512（回到原长度）
+    assert converted_seqs == [512, 256, 512], converted_seqs
+    assert len(compress_calls) == 2, "兜底那次不该再做量化"
+    assert any("未量化" in m for m in hooks.logs), hooks.logs
+    assert "已改为未量化输出" in result.message, result.message
+    assert "4-bit" not in result.message, result.message
+
+
+def test_run_aborts_when_checkpoint_layout_mismatch(tmp_path, monkeypatch):
+    """权重名对不上时中止：随机权重转换出来的模型是无效的，不能当成成功。"""
+    src = _write_config(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    monkeypatch.setattr(real_backend_mod, "_import_heavy", _stub_libs)
+    monkeypatch.setattr(real_backend_mod, "_load_config",
+                        lambda s, l: types.SimpleNamespace(use_cache=True))
+    monkeypatch.setattr(real_backend_mod, "_expected_state_shapes",
+                        lambda l, c: {"model.layers.0.q_proj.weight": (4, 4)})
+    monkeypatch.setattr(real_backend_mod, "_checkpoint_tensor_shapes",
+                        lambda s: {"vision_tower.patch.weight": (4, 4)})
+    hooks = RecordingHooks()
+    result = CoremltoolsBackend(src, out).run(hooks)
+    assert result.success is False
+    assert result.cancelled is False
+    assert "权重名" in result.message, result.message
+    # 只在"加载"阶段就中止，不能进入追踪/转换
+    assert not [m for m in hooks.logs if m.startswith("[2/")]
+    assert not (out / "m.mlpackage").exists()
+
+
+# --------------------------------------------------------------------- #
 # coremltools 后端（桩依赖）
 # --------------------------------------------------------------------- #
 
@@ -493,8 +830,9 @@ def test_real_backend_sets_metadata_and_swift_example(tmp_path, monkeypatch):
     libs.ct.convert = _convert
     _orig_factory = libs.ct.models.MLModel
 
-    def _factory(spec=None, weights_dir=None):
+    def _factory(spec=None, weights_dir=None, compute_units=None):
         saved_specs.append(spec)
+        assert compute_units == libs.ct.ComputeUnit.CPU_ONLY, "落盘重建不应触发 ANE 编译"
         return _orig_factory(spec)
 
     libs.ct.models.MLModel = _factory

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 from modconv.backend import probe_backend
 from modconv.converter import ConversionResult, ModelConverter
@@ -13,11 +13,33 @@ from modconv.real_backend import CoremltoolsBackend
 from modconv.scanner import FileInfo, scan_directory
 
 
+# 运行中的 QThread 必须至少保有一个 Python 强引用：QThread 在运行期间被销毁会
+# 触发 Qt 的 qFatal → 进程直接 abort（Python 层既捕获不到也无法降级）。仅要求
+# 调用方"自己记得保留引用"太脆弱——局部变量一出作用域就可能被 GC，而线程通常
+# 还要再跑几毫秒。因此这里由基类统一登记/注销：start() 时登记，线程真正结束后
+# （finished 已在主线程派发）注销，使任何用法都不会中途销毁线程。
+_LIVE_WORKERS: set = set()
+
+
+class _TrackedThread(QThread):
+    """带生命周期保护的 QThread 基类（防止运行中被 GC 导致进程 abort）。"""
+
+    def start(self, *args, **kwargs) -> None:
+        _LIVE_WORKERS.add(self)
+        # finished 在线程停止后由 Qt 发出；强制排队连接，让注销发生在主线程
+        # 事件循环中——此时线程已停止，销毁才是安全的
+        self.finished.connect(self._release, Qt.ConnectionType.QueuedConnection)
+        super().start(*args, **kwargs)
+
+    def _release(self) -> None:
+        _LIVE_WORKERS.discard(self)
+
+
 class _ScanCancelled(Exception):
     """扫描被取消：用于从扫描回调里提前退出（不算错误）。"""
 
 
-class ScanWorker(QThread):
+class ScanWorker(_TrackedThread):
     """后台目录扫描。"""
 
     scan_progress = pyqtSignal(int, int)   # 已扫描文件数, 累计字节
@@ -48,10 +70,14 @@ class ScanWorker(QThread):
         except OSError as exc:
             self.scan_error.emit(str(exc))
             return
+        except Exception as exc:
+            # 未捕获异常逃出 run() 会让 PyQt 直接结束进程，任何意外都必须转成错误信号
+            self.scan_error.emit(f"{type(exc).__name__}: {exc}")
+            return
         self.scan_finished.emit(result)
 
 
-class ConversionWorker(QThread):
+class ConversionWorker(_TrackedThread):
     """后台模型转换。"""
 
     log_message = pyqtSignal(str)
@@ -63,13 +89,15 @@ class ConversionWorker(QThread):
 
     def __init__(self, source: Path, output_dir: Path, files: Sequence[FileInfo],
                  parent=None, backend: str = "auto", max_seq_len: int | None = None,
-                 **kwargs):
+                 quantize_nbits: int | None = 4, **kwargs):
         super().__init__(parent)
         self._source = Path(source)
         self._output_dir = Path(output_dir)
         self._files = list(files)
         self._backend = backend
         self._max_seq_len = max_seq_len
+        # 权重压缩位数：只有真实转换后端用得到；打包后端忽略（原样 1:1 拷贝）
+        self._quantize_nbits = quantize_nbits
         self._kwargs = kwargs
         self._cancelled = False
 
@@ -101,7 +129,8 @@ class ConversionWorker(QThread):
             if plan.name == "coremltools":
                 try:
                     result = CoremltoolsBackend(self._source, self._output_dir,
-                                                max_seq_len=self._max_seq_len).run(hooks)
+                                                max_seq_len=self._max_seq_len,
+                                                quantize_nbits=self._quantize_nbits).run(hooks)
                 except Exception as exc:
                     # 真实转换失败直接报错，禁止降级回打包后端（打包产物不是
                     # 可用的 Core ML 模型，静默回退会掩盖失败）。

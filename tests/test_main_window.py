@@ -170,6 +170,70 @@ def test_start_passes_max_seq_len_to_worker(qtbot, window, model_dir, tmp_path, 
 
 
 # --------------------------------------------------------------------- #
+# 4-bit 权重压缩开关
+# --------------------------------------------------------------------- #
+
+def test_quantize_toggle_defaults_on_and_passes_to_worker(qtbot, window, model_dir,
+                                                          tmp_path, monkeypatch):
+    """默认做 4-bit 压缩；取消勾选后应向 worker 传 None（关闭量化）。"""
+    from unittest.mock import MagicMock
+
+    captured = []
+
+    def _spy_cls(source, output, files, **kwargs):
+        captured.append(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr("modconv.main_window.ConversionWorker", _spy_cls)
+    _prepare_scan(qtbot, window, model_dir)
+    window.output_edit.setText(str(tmp_path / "out"))
+    assert window.quantize_check.isChecked()
+
+    def _click_and_reset():
+        window.start_button.click()
+        qtbot.wait(100)
+        # 桩 worker 不会真正结束：手动复位运行状态，才能再点一次"开始"
+        window._conv_worker = None
+        window._conv_workers.clear()
+        window._set_running(False)
+
+    _click_and_reset()
+    assert captured[-1].get("quantize_nbits") == 4
+
+    window.quantize_check.setChecked(False)
+    _click_and_reset()
+    assert captured[-1].get("quantize_nbits") is None
+
+
+def test_quantize_toggle_updates_estimate(qtbot, window, hf_model_dir, tmp_path):
+    """关掉压缩后体积预估应切换为 fp16 口径（显著大于 4-bit 估算）。"""
+    import re
+
+    _prepare_scan(qtbot, window, hf_model_dir)
+    window.output_edit.setText(str(tmp_path / "out"))
+    before = window.estimate_stats_label.text()
+    assert "4-bit 压缩估算" in before
+    window.quantize_check.setChecked(False)
+    after = window.estimate_stats_label.text()
+    assert "fp16 未压缩估算" in after
+
+    def _bytes(text):
+        m = re.search(r"([\d.]+)\s*(B|KB|MB|GB)", text)
+        unit = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}[m.group(2)]
+        return float(m.group(1)) * unit
+
+    assert _bytes(after) > _bytes(before) * 2
+
+
+def test_running_disables_quantize_check(window):
+    """转换运行中压缩开关应与其它配置一致被禁用。"""
+    window._set_running(True)
+    assert not window.quantize_check.isEnabled()
+    window._set_running(False)
+    assert window.quantize_check.isEnabled()
+
+
+# --------------------------------------------------------------------- #
 # 健壮性与体验
 # --------------------------------------------------------------------- #
 
@@ -233,3 +297,61 @@ def test_close_event_without_worker(window):
     event = QCloseEvent()
     window.closeEvent(event)
     assert event.isAccepted()
+
+
+def test_close_event_waits_for_worker_that_already_reported(window):
+    """结果已发出、但线程还在收尾时关闭窗口，也不能漏掉它。
+
+    conversion_finished 是在 run() 内部发出的，此时 _conv_worker 已置空，
+    只看它会认为"没有转换在跑"而直接接受关闭 → 销毁运行中的 QThread。
+    """
+    from unittest.mock import MagicMock
+
+    from PyQt6.QtGui import QCloseEvent
+
+    worker = MagicMock()
+    worker.wait.return_value = True
+    window._conv_worker = None
+    window._conv_workers = [worker]
+    event = QCloseEvent()
+    window.closeEvent(event)
+    worker.cancel.assert_called_once()
+    assert event.isAccepted()
+
+
+def test_start_ignored_while_previous_thread_still_exiting(qtbot, window, model_dir, tmp_path):
+    """上一轮线程还在收尾时不应再起一次转换（两个线程会同时写同一输出目录）。"""
+    from unittest.mock import MagicMock
+
+    _prepare_scan(qtbot, window, model_dir)
+    window.output_edit.setText(str(tmp_path / "out"))
+    window._conv_workers = [MagicMock()]  # 上一轮结果已到、线程未退出
+    window.start_button.click()
+    qtbot.wait(100)
+    assert window._conv_worker is None
+
+
+def test_worker_reference_released_after_thread_exit(qtbot, window, model_dir, tmp_path):
+    """转换结束后不应继续持有 worker（它攥着整份 FileInfo 清单，大目录上是内存滞留）。"""
+    out = tmp_path / "out"
+    _prepare_scan(qtbot, window, model_dir)
+    window.output_edit.setText(str(out))
+    with qtbot.waitSignal(window.conversion_finished, timeout=20000):
+        window.start_button.click()
+    qtbot.waitUntil(lambda: not window._conv_workers, timeout=5000)
+    assert window._conv_worker is None
+
+
+def test_new_scan_cancels_stale_scan(qtbot, window, model_dir):
+    """发起新扫描时，结果已作废的旧扫描应被取消（别再抢磁盘带宽）。"""
+    from unittest.mock import MagicMock
+
+    stale = MagicMock()
+    stale.isRunning.return_value = True
+    window._scan_workers = [stale]
+    window.source_edit.setText(str(model_dir))
+    window._refresh_scan()
+    stale.cancel.assert_called_once()
+    # 新扫描照常生效（旧扫描的结果不会被采纳）
+    qtbot.waitUntil(lambda: window._scan_result is not None, timeout=5000)
+    assert "5 个文件" in window.source_stats_label.text()

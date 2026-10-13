@@ -50,6 +50,10 @@ def scan_directory(
 
     progress_cb(processed_count, running_bytes) 每处理 SCAN_PROGRESS_EVERY 个
     文件上报一次，供 GUI 实时显示大目录的扫描进度。
+
+    用 os.scandir 直接遍历：DirEntry 自带 d_type，判定符号链接/目录通常无需
+    系统调用，每个文件只剩一次 stat（原 os.walk + Path 写法是两次 stat 再加
+    一次 relative_to 字符串运算）。显式栈代替递归，避免深目录爆栈。
     """
     root = Path(root)
     if not root.exists():
@@ -60,20 +64,41 @@ def scan_directory(
     files: List[FileInfo] = []
     processed = 0
     running_bytes = 0
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames.sort()
-        for name in sorted(filenames):
-            path = Path(dirpath) / name
-            if path.is_symlink():
-                continue
-            try:
-                size = path.stat().st_size
-            except OSError:
-                size = 0  # 扫描期间文件被移除
-            relpath = path.relative_to(root).as_posix()
-            files.append(FileInfo(relpath, size, is_weight_file(name)))
+    # (目录绝对路径, 该目录相对 root 的 posix 前缀)
+    stack = [(str(root), "")]
+    while stack:
+        dirpath, prefix = stack.pop()
+        subdirs = []
+        plain_files = []  # [(文件名, 字节数)]，趁着 scandir 迭代器还活着就取完 stat
+        try:
+            with os.scandir(dirpath) as entries:
+                for entry in entries:
+                    try:
+                        # 符号链接一律跳过（与 followlinks=False 语义一致：
+                        # 不跟随、不重复统计）
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir():
+                            subdirs.append(entry.name)
+                            continue
+                        try:
+                            size = entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            size = 0  # 扫描期间文件被移除：仍列出，转换阶段会记录并跳过
+                    except OSError:
+                        continue  # 条目状态已失效
+                    plain_files.append((entry.name, size))
+        except OSError:
+            continue  # 目录不可读（权限变化/被移除）：跳过，不让整次扫描失败
+        # 按文件名排序：保证扫描结果与文件系统返回顺序无关（进度、日志可复现）
+        plain_files.sort(key=lambda item: item[0])
+        for name, size in plain_files:
+            files.append(FileInfo(prefix + name, size, is_weight_file(name)))
             processed += 1
             running_bytes += size
             if progress_cb is not None and processed % SCAN_PROGRESS_EVERY == 0:
                 progress_cb(processed, running_bytes)
+        # 栈是 LIFO：逆序压入，出栈顺序才是字典序（与旧实现一致）
+        for name in sorted(subdirs, reverse=True):
+            stack.append((os.path.join(dirpath, name), f"{prefix}{name}/"))
     return ScanResult(source=root, files=files)

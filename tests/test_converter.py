@@ -148,9 +148,11 @@ def test_cancel_midway(tmp_path):
     assert result.cancelled is True
     assert result.success is False
     assert result.files_done == 1
+    # 半成品包对调用方没有价值却可能占几 GB：取消即删除
+    assert result.output_path is None
+    assert not (out / "m.mlpackage").exists()
     b_dest = out / "m.mlpackage" / "Data" / "com.apple.CoreML" / "weights" / "b.safetensors"
-    assert b_dest.exists()
-    assert 0 < b_dest.stat().st_size < (4 << 20)
+    assert not b_dest.exists()
 
 
 def test_rejects_relpath_escaping_package(tmp_path):

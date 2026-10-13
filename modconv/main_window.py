@@ -16,6 +16,7 @@ from pathlib import Path
 from PyQt6.QtCore import QEventLoop, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -65,8 +66,12 @@ class MainWindow(QMainWindow):
         self._scan_source: Path | None = None
         self._scan_gen = 0
         self._scan_workers: list[ScanWorker] = []
+        # _conv_worker：当前（或最近一次）转换，供"取消"使用；
+        # _conv_workers：所有尚未退出的转换线程。二者分开是因为 conversion_finished
+        # 是在线程 run() 内部发出的，此时线程还要再跑几毫秒才真正退出——若在那
+        # 一刻就把唯一引用置空，关闭窗口会漏掉它（销毁运行中的 QThread 会崩溃）。
         self._conv_worker: ConversionWorker | None = None
-        self._retired_workers: list[ConversionWorker] = []
+        self._conv_workers: list[ConversionWorker] = []
         self._pending_start = False
         self._splitter_configured = False
 
@@ -119,6 +124,18 @@ class MainWindow(QMainWindow):
             "留空时自动选取：取模型位置编码上限与 512 中的较小值；\n"
             "输入超过模型位置编码上限时会被自动截断。")
         grid.addWidget(self.max_seq_edit, 2, 1)
+
+        # 4-bit 权重压缩：体积约为未量化的 1/4～1/8，但部分架构（如 Qwen3.5 的
+        # GDN 混合注意力）量化后的图在 ANE 上构建不了执行计划——工具会自动退回
+        # 未量化重转（要多花一倍以上时间），这里允许直接关掉以省时。
+        self.quantize_check = QCheckBox("权重 4-bit 压缩（减小体积；关闭则输出 fp16 全精度）")
+        self.quantize_check.setChecked(True)
+        self.quantize_check.setToolTip(
+            "对输出权重做 4-bit palettization，模型体积约为未压缩的 1/4～1/8。\n"
+            "少数架构量化后无法在 ANE 上运行，工具会自动改为未量化重转；\n"
+            "若已知目标架构不支持（或想省去这次重转），可取消勾选。")
+        self.quantize_check.toggled.connect(lambda _: self._refresh_estimate())
+        grid.addWidget(self.quantize_check, 3, 0, 1, 2)
 
         # 手动输入路径后延迟触发扫描：连续敲键盘/多次回车会各起一次全目录扫描
         # （旧扫描无法取消，还会互相抢占），防抖后只保留最后一次
@@ -206,6 +223,11 @@ class MainWindow(QMainWindow):
         # 任何"放弃本次扫描"的分支都要递增 _scan_gen：否则仍在飞行的旧扫描
         # 结果回来后会覆盖这里刚写入的状态（UI 显示已失效目录的统计）
         self._scan_gen += 1
+        # 上一次扫描的结果已因 gen 递增而作废，继续跑只会白占 CPU/IO、和本次
+        # 扫描抢磁盘带宽（大目录上很明显），无论本次是否真的再起扫描都先取消
+        for stale in self._scan_workers:
+            if self._thread_alive(stale):
+                stale.cancel()
         if not text:
             self._scan_result = None
             self._scan_source = None
@@ -241,6 +263,12 @@ class MainWindow(QMainWindow):
         except ValueError:
             pass
 
+    def _forget_conv_worker(self, worker) -> None:
+        try:
+            self._conv_workers.remove(worker)
+        except ValueError:
+            pass
+
     def _on_scan_progress(self, gen: int, count: int, size: int):
         if gen != self._scan_gen:
             return
@@ -255,6 +283,25 @@ class MainWindow(QMainWindow):
         self._pending_start = False
         self.source_stats_label.setText(f"扫描失败: {message}")
 
+    def _refresh_estimate(self):
+        """按当前扫描结果 + 架构预判 + 压缩开关刷新体积预估。"""
+        scan = self._scan_result
+        if scan is None:
+            return
+        # 体积预估按架构预判的后端口径计算：支持的架构走真实转换，否则按打包 1:1。
+        # 这里只做 config.json 的轻量读取，不导入 torch/coremltools 以免卡顿。
+        model_type = detect_model_type(scan.source)
+        backend = ("coremltools" if model_type in SUPPORTED_MODEL_TYPES
+                   else "package")
+        estimate = estimate_output(scan, backend=backend,
+                                   compressed=self.quantize_check.isChecked())
+        note = ("（打包口径）" if backend == "package"
+                else "（4-bit 压缩估算）" if self.quantize_check.isChecked()
+                else "（fp16 未压缩估算）")
+        self.estimate_stats_label.setText(
+            f"预计 Core ML 输出: ≈{estimate.file_count} 个文件, "
+            f"{format_size(estimate.total_bytes)}{note}")
+
     def _on_scan_finished(self, gen: int, result: ScanResult):
         if gen != self._scan_gen:
             return
@@ -262,17 +309,16 @@ class MainWindow(QMainWindow):
         self._scan_source = result.source
         self.source_stats_label.setText(
             f"MLX 模型目录: {result.count} 个文件, {format_size(result.total_bytes)}")
-        # 体积预估按架构预判的后端口径计算：支持的架构走真实转换
-        # （fp16 + 4-bit 压缩，显著小于源），否则按打包 1:1 估算。
-        # 这里只做 config.json 的轻量读取，不导入 torch/coremltools 以免卡顿。
+        self._refresh_estimate()
+        # 不支持/无法识别的架构会在转换时才暴露（转换失败或退回打包产物），
+        # 扫描阶段就提示，避免用户等半天才发现走了兜底路径
         model_type = detect_model_type(result.source)
-        backend = ("coremltools" if model_type in SUPPORTED_MODEL_TYPES
-                   else "package")
-        estimate = estimate_output(result, backend=backend)
-        self.estimate_stats_label.setText(
-            f"预计 Core ML 输出: ≈{estimate.file_count} 个文件, "
-            f"{format_size(estimate.total_bytes)}"
-            + ("（4-bit 压缩估算）" if backend == "coremltools" else "（打包口径）"))
+        if model_type not in SUPPORTED_MODEL_TYPES:
+            arch = model_type or "未识别（缺少或非法的 config.json）"
+            hint = (f"架构 '{arch}' 暂不支持真实转换，将使用打包后端"
+                    if model_type else f"{arch}，将使用打包后端")
+            self._log(hint)
+            self._set_status(hint)
         self.scan_completed.emit(result)
         if self._pending_start:
             self._pending_start = False
@@ -282,7 +328,9 @@ class MainWindow(QMainWindow):
     # 转换
     # ------------------------------------------------------------------ #
     def _on_start_clicked(self):
-        if self._conv_worker is not None:
+        # 上一轮转换的线程可能还在收尾（结果已到但未退出），此时也不能再起一次：
+        # 两个转换线程同时写同一个输出目录会互相破坏
+        if self._conv_worker is not None or self._conv_workers:
             return
         source = self._source_path_from_input()
         if source is None:
@@ -362,7 +410,7 @@ class MainWindow(QMainWindow):
             return False
 
     def _begin_conversion(self):
-        if self._scan_result is None or self._conv_worker is not None:
+        if self._scan_result is None or self._conv_worker is not None or self._conv_workers:
             return
         # 最大上下文长度：留空 = 自动；非法输入直接拦截（提示已在解析时给出）
         max_seq_len = self._max_seq_len_from_input()
@@ -379,15 +427,23 @@ class MainWindow(QMainWindow):
         self._set_running(True)
         self.progress_bar.setValue(0)
         self._log(f"开始转换: {source.name} → {output}")
-        self._conv_worker = ConversionWorker(source, output, self._scan_result.files,
-                                             max_seq_len=max_seq_len)
-        self._conv_worker.log_message.connect(self._log)
-        self._conv_worker.file_started.connect(self._on_file_started)
-        self._conv_worker.file_progress.connect(self._on_file_progress)
-        self._conv_worker.overall_progress.connect(self._on_overall_progress)
-        self._conv_worker.conversion_finished.connect(self._on_conversion_finished)
-        self._conv_worker.finished.connect(self._conv_worker.deleteLater)
-        self._conv_worker.start()
+        worker = ConversionWorker(source, output, self._scan_result.files,
+                                  max_seq_len=max_seq_len,
+                                  quantize_nbits=(4 if self.quantize_check.isChecked()
+                                                  else None))
+        self._conv_worker = worker
+        self._conv_workers.append(worker)
+        worker.log_message.connect(self._log)
+        worker.file_started.connect(self._on_file_started)
+        worker.file_progress.connect(self._on_file_progress)
+        worker.overall_progress.connect(self._on_overall_progress)
+        worker.conversion_finished.connect(self._on_conversion_finished)
+        # 线程真正退出后才解除持有：此后 deleteLater 已经排好队，交回 Qt 即可。
+        # 不再用"退役列表"长期保留——那些 worker 还攥着整份 FileInfo 清单，
+        # 大目录上是实打实的内存滞留。
+        worker.finished.connect(lambda w=worker: self._forget_conv_worker(w))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def _on_file_started(self, relpath: str, size: int, index: int, total: int):
         self._set_status(f"({index}/{total}) 正在转换: {relpath} ({format_size(size)})")
@@ -408,11 +464,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(min(100, pct))
 
     def _on_conversion_finished(self, result):
-        worker = self.sender()
-        if isinstance(worker, ConversionWorker):
-            # 保留引用直到线程完全退出，避免运行中的 QThread 被 GC
-            self._retired_workers.append(worker)
-            del self._retired_workers[:-5]
+        # 线程此刻可能仍在退出途中，引用仍留在 _conv_workers 里，不能在这里丢弃
         self._conv_worker = None
         self._pending_start = False
         self._set_running(False)
@@ -424,24 +476,33 @@ class MainWindow(QMainWindow):
         self.conversion_finished.emit(result)
 
     def _on_cancel_clicked(self):
-        if self._conv_worker is not None:
-            self._conv_worker.cancel()
-            self.cancel_button.setEnabled(False)
-            self._log("已请求取消转换，等待当前块结束…")
+        # _conv_worker 已置空但线程还没退出时（结果已到、收尾中），仍要能取消
+        targets = self._conv_workers or ([self._conv_worker] if self._conv_worker else [])
+        if not targets:
+            return
+        for worker in targets:
+            worker.cancel()
+        self.cancel_button.setEnabled(False)
+        self._log("已请求取消转换，等待当前块结束…")
 
     # ------------------------------------------------------------------ #
     # 公共小工具
     # ------------------------------------------------------------------ #
     def _log(self, message: str):
+        # 只在用户没有手动往上翻看历史时自动跟随到底部，避免打断阅读
+        bar = self.log_view.verticalScrollBar()
+        follow = bar.value() >= bar.maximum() - 4
         self.log_view.appendPlainText(f"[{time.strftime('%H:%M:%S')}] {message}")
+        if follow:
+            bar.setValue(bar.maximum())
 
     def _set_status(self, message: str):
         self.status_label.setText(message)
 
     def _set_running(self, running: bool):
         for widget in (self.source_edit, self.output_edit, self.max_seq_edit,
-                       self.source_browse_btn, self.output_browse_btn,
-                       self.start_button):
+                       self.quantize_check, self.source_browse_btn,
+                       self.output_browse_btn, self.start_button):
             widget.setEnabled(not running)
         self.cancel_button.setEnabled(running)
 
@@ -475,10 +536,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """关闭窗口前确保后台线程已退出：QThread 运行中被销毁会导致进程崩溃。"""
-        worker = self._conv_worker
-        if worker is not None:
-            worker.cancel()
+        # 防抖定时器还有一次待触发的扫描：先停掉，避免关闭后又起一个线程
+        self._scan_debounce.stop()
+        # 已发出 conversion_finished、但线程尚未真正退出的转换线程也必须等：
+        # 只看 _conv_worker 会漏掉这段窗口期
+        conv_workers = list(self._conv_workers)
+        if self._conv_worker is not None and self._conv_worker not in conv_workers:
+            conv_workers.append(self._conv_worker)
+        if conv_workers:
             self._log("窗口关闭：已请求取消转换，等待后台线程退出…")
+        for worker in conv_workers:
+            worker.cancel()
             if not self._wait_for_thread(worker, _CLOSE_WAIT_MS):
                 # 深度转换阶段（反量化/图转换）不可中断，超时则拒绝关闭
                 event.ignore()

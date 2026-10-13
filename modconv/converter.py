@@ -163,7 +163,10 @@ class ModelConverter:
         if cancelled:
             message = f"转换已取消: 已完成 {files_done}/{total_files} 个文件"
             hooks.on_log(message)
-            return finish(False, True, message, package, files_done, overall_done)
+            # 半成品包对调用方没有价值（缺 Manifest、权重不全），却可能占几 GB：
+            # 取消即删除，避免反复取消后在磁盘上堆下一串废包
+            shutil.rmtree(package, ignore_errors=True)
+            return finish(False, True, message, None, files_done, overall_done)
 
         (package / MANIFEST_NAME).write_bytes(manifest_bytes)
         overall_done += len(manifest_bytes)

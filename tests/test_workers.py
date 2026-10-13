@@ -50,6 +50,28 @@ def test_scan_worker_cancel_stops_early(qtbot, model_dir):
     assert finished == []
 
 
+def test_running_worker_survives_losing_external_reference(qtbot, model_dir):
+    """运行中丢掉最后一个外部引用也不能让 QThread 被销毁。
+
+    QThread 在运行期间被销毁会触发 Qt 的 qFatal（进程直接 abort，Python 层既
+    捕获不到也无法降级）。只靠调用方"记得保留引用"不够——局部变量一出作用域
+    就可能被 GC，而线程往往还要再跑几毫秒。基类必须在 start()/finished 之间
+    自己持有一份引用，并在线程真正结束后释放（否则就是内存泄漏）。
+    """
+    import gc
+
+    from modconv import workers as workers_mod
+
+    worker = ScanWorker(model_dir)
+    worker.start()
+    assert worker in workers_mod._LIVE_WORKERS
+    del worker  # 调用方彻底放手
+    gc.collect()
+    assert workers_mod._LIVE_WORKERS, "运行中的线程必须仍被登记保护"
+    # 线程结束后登记要解除，不能一直挂着（Worker 还攥着整份文件清单）
+    qtbot.waitUntil(lambda: not workers_mod._LIVE_WORKERS, timeout=5000)
+
+
 def test_conversion_worker_success(qtbot, model_dir, tmp_path):
     out = tmp_path / "out"
     out.mkdir()

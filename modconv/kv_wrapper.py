@@ -39,6 +39,8 @@ from transformers.cache_utils import (
     StaticLayer,
 )
 
+from modconv.utils import ATTENTION_LAYER_TYPES
+
 
 class _SlotStaticLayer(StaticLayer):
     """StaticLayer 变体：写入槽位 = arange(kv_length) + cumulative_length，
@@ -85,6 +87,155 @@ class _SlotStaticLayer(StaticLayer):
             values[:, :, cache_position] = value_states.to(kv_dtype)
         # 注意力消费方与 key_states 同精度（eager fp32 / 导出后统一 fp16）
         return keys.to(key_states.dtype), values.to(value_states.dtype)
+
+
+def _stable_softplus(x: torch.Tensor) -> torch.Tensor:
+    """fp16 安全的 softplus（与 `F.softplus` 数值等价）。
+
+    `F.softplus(x)` 即 `log1p(exp(x))`：exp 的中间结果随 x 增大而爆炸，在 Core ML
+    的 fp16 图里这条链会在部分输入上产出 NaN——实测 Qwen3.5 的 GDN 衰减计算
+    （`g = -exp(A_log) * softplus(a + dt_bias)`）就是这样让整个模型输出全 NaN 的，
+    而 torch（fp32/fp16）完全正常，因为内核内部会 `.float()` 升精度。
+
+    稳定形式 `max(x, 0) + log1p(exp(-|x|))` 的中间值恒 ≤ 1，任何精度下都不会溢出；
+    且 softplus(x) = x + log1p(exp(-x))（x>0）与 log1p(exp(x))（x≤0）本就是同一
+    函数的两种写法，fp16 分辨率内逐位等价。
+    """
+    return torch.clamp(x, min=0) + torch.log1p(torch.exp(-torch.abs(x)))
+
+
+def _chunk_matrix(size: int, device, dtype, lower_strict: bool = False) -> torch.Tensor:
+    """分块内核用的 (1, 1, 1, size, size) 常量矩阵：单位阵或严格下三角掩码。
+
+    两个原因都必须"显式补齐到 5 维"，不能用 rank-2 张量隐式广播：
+    1. `torch.tril(x, -1)` 作用在 5-D 张量上时，coremltools 的编译结果与原语义
+       不符（实测余弦相似度从 0.9997 掉到 -0.14，整个 GDN 层算错）；
+    2. `ut_system + torch.eye(...)` 这种"rank-2 常量广播进 rank-5"的加法，同样
+       与 torch 结果不一致（实测 cos -0.16）。显式 reshape 成同秩后即一致。
+    """
+    idx = torch.arange(size, device=device)
+    # 单位阵也用比较构造：torch.eye 在转换后同样与 torch 结果不一致
+    mat = (idx[:, None] > idx[None, :] if lower_strict
+           else idx[:, None] == idx[None, :]).to(dtype)
+    return mat.view(1, 1, 1, size, size)
+
+
+def _modconv_chunk_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int = 64,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Gated Delta Rule 分块内核的导出适配实现。
+
+    改自 transformers/models/qwen3_5/modeling_qwen3_5.py 的
+    `torch_chunk_gated_delta_rule`（Apache-2.0）。原版有两处在 Core ML 的 fp16
+    图里会算错（都是 torch 侧完全正常的写法）：
+
+    1. `ut_system.tril(-1)`：编译结果与原语义不符 → 改用常量严格下三角掩码
+       （见 `_strictly_lower_mask`）；
+    2. 衰减 g 里的 `F.softplus`：见 `_stable_softplus`（由 `_qwen35_gdn_forward`
+       传入的 g 已经算好，这里不再涉及）。
+
+    其余逻辑与原版一致。
+    """
+    import torch.nn.functional as F
+
+    initial_dtype = query.dtype
+    batch_size, sequence_length, _, k_head_dim = key.shape
+    num_v_heads, v_head_dim = value.shape[-2:]
+    recurrent_state_shape = (batch_size, num_v_heads, k_head_dim, v_head_dim)
+    padded_output_shape = (batch_size, num_v_heads, -1, v_head_dim)
+    decay = g
+
+    query, key, value, beta, decay = [
+        x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
+        for x in (query, key, value, beta, decay)
+    ]
+    if use_qk_l2norm_in_kernel:
+        query = _l2norm(query, dim=-1, eps=1e-6)
+        key = _l2norm(key, dim=-1, eps=1e-6)
+    scaling = query.shape[-1] ** -0.5
+    query = query * scaling
+
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    query, key, value = (F.pad(x, (0, 0, 0, pad_size)) for x in (query, key, value))
+    beta, decay = (F.pad(x, (0, pad_size)) for x in (beta, decay))
+
+    total_sequence_length = sequence_length + pad_size
+    num_chunks = total_sequence_length // chunk_size
+
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+
+    query, key, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (query, key, k_beta, v_beta)
+    ]
+    decay = decay.reshape(decay.shape[0], decay.shape[1], -1, chunk_size)
+
+    strictly_upper_mask = torch.ones(chunk_size, chunk_size, dtype=torch.bool,
+                                     device=query.device).triu(1)
+    lower_mask = _chunk_matrix(chunk_size, query.device, query.dtype,
+                               lower_strict=True)
+    eye = _chunk_matrix(chunk_size, query.device, query.dtype)
+
+    cum_decay = decay.cumsum(dim=3)
+
+    pairwise_decay = cum_decay.unsqueeze(4) - cum_decay.unsqueeze(3)
+    pairwise_decay = pairwise_decay.masked_fill(strictly_upper_mask, float("-inf"))
+    pairwise_decay = pairwise_decay.exp()
+
+    ut_system = (k_beta @ key.transpose(-1, -2)) * pairwise_decay
+    intra_chunk_attn = (query @ key.transpose(-1, -2)) * pairwise_decay
+    decayed_k_beta = k_beta * cum_decay.exp().unsqueeze(-1)
+
+    # 原版是 `-ut_system.tril(-1)`：改用常量严格下三角掩码（见函数文档）
+    ut_system = -ut_system * lower_mask
+    for i in range(1, chunk_size):
+        row = ut_system[..., i, :i].clone()
+        sub = ut_system[..., :i, :i].clone()
+        ut_system[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    ut_system = ut_system + eye
+    new_values, k_cumdecay = ut_system @ v_beta, ut_system @ decayed_k_beta
+
+    if initial_state is None:
+        last_recurrent_state = torch.zeros(recurrent_state_shape,
+                                           dtype=new_values.dtype,
+                                           device=new_values.device)
+    else:
+        last_recurrent_state = initial_state.to(new_values)
+    core_attn_out = torch.zeros_like(new_values)
+
+    query = query * cum_decay.exp().unsqueeze(-1)
+    key = key * (cum_decay[..., -1:] - cum_decay).exp().unsqueeze(-1)
+    chunk_decay = cum_decay[..., -1].exp()[..., None, None]
+
+    for i in range(num_chunks):
+        v_new = new_values[:, :, i] - k_cumdecay[:, :, i] @ last_recurrent_state
+        inter_chunk_attn = query[:, :, i] @ last_recurrent_state
+        core_attn_out[:, :, i] = inter_chunk_attn + intra_chunk_attn[:, :, i] @ v_new
+        last_recurrent_state = (last_recurrent_state * chunk_decay[:, :, i]
+                                + key[:, :, i].transpose(-1, -2) @ v_new)
+
+    last_recurrent_state = None if not output_final_state else last_recurrent_state
+    core_attn_out = core_attn_out.reshape(padded_output_shape)
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).to(
+        initial_dtype, memory_format=torch.contiguous_format)
+    return core_attn_out, last_recurrent_state
+
+
+def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """与 FLA 库一致的 L2 归一化（原版内核内部函数）。"""
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x * inv_norm
 
 
 def _qwen35_gdn_forward(self, hidden_states, cache_params, attention_mask=None, **kwargs):
@@ -205,7 +356,9 @@ def _qwen35_gdn_forward(self, hidden_states, cache_params, attention_mask=None, 
 
     beta = b.sigmoid()
     # If the model is loaded in fp16, without the .float() here, A might be -inf
-    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+    # softplus 必须用稳定形式：F.softplus 在 Core ML 的 fp16 图里会产生 NaN
+    # （见 _stable_softplus 文档）
+    g = -self.A_log.float().exp() * _stable_softplus(a.float() + self.dt_bias)
     if real_mask is not None:
         g = g * real_mask.to(g.dtype).view(1, seq_len, -1)
     if self.num_v_heads // self.num_k_heads > 1:
@@ -361,7 +514,7 @@ class KvCacheWrapper(nn.Module):
         # 混合架构检测：layer_types 中非 full/sliding/chunked 的层视为 linear attention
         layer_types = list(getattr(config, "layer_types", None) or [])
         linear_idx = {i for i, t in enumerate(layer_types)
-                      if t not in ("full_attention", "sliding_attention", "chunked_attention")}
+                      if t not in ATTENTION_LAYER_TYPES}
         self._hybrid = bool(linear_idx) and len(layer_types) == self.num_layers
         if self._hybrid and self.max_seq_len < 2:
             raise ValueError("混合注意力模型（linear attention）的 max_seq_len 至少为 2")
@@ -433,11 +586,13 @@ class KvCacheWrapper(nn.Module):
                     f"第 {i} 层未找到 GatedDeltaNet 模块（实际: "
                     f"{type(mixer).__name__ if mixer is not None else 'None'}）")
             mixers[i] = mixer
-            # 内核函数从 mixer 所属模型模块解析（dense / MoE 各一份），追踪前固定
+            # 前两个内核函数从 mixer 所属模型模块解析（dense / MoE 各一份），追踪
+            # 前固定；分块内核用本模块的导出适配版本（原版有两处在 Core ML 的 fp16
+            # 图里算错，见 _modconv_chunk_gated_delta_rule 文档）
             kernels_mod = importlib.import_module(type(mixer).__module__)
             mixer._modconv_kernels = (kernels_mod.apply_mask_to_padding_states,
                                       kernels_mod.causal_conv1d_fn,
-                                      kernels_mod.torch_chunk_gated_delta_rule)
+                                      _modconv_chunk_gated_delta_rule)
             mixer.forward = MethodType(_qwen35_gdn_forward, mixer)
 
         # 全部 GDN 层的 conv/rec state 各合并为单个大 buffer（与 kv_all 同理：
@@ -493,6 +648,21 @@ class KvCacheWrapper(nn.Module):
     def reset_state(self) -> None:
         for buf in self.state_buffers():
             buf.zero_()
+
+    def _hidden_states(self, ids, positions, cache_position, mask):
+        """混合架构路径的主干前向（不含 lm_head）；结构不适用时返回 None。
+
+        pad 到 max_seq_len 只为静态化 GDN 分块循环，输出只需真实的前 q 个位置；
+        lm_head 逐位置独立，因此先切再算比先算再切省掉整个 (max_seq_len, vocab)
+        的中间张量（见 forward 内注释）。
+        """
+        base = getattr(self.inner, "model", None)
+        if base is None or not hasattr(self.inner, "lm_head"):
+            return None
+        out = base(input_ids=ids, position_ids=positions,
+                   cache_position=cache_position, attention_mask=mask,
+                   past_key_values=self._cache, use_cache=True)
+        return getattr(out, "last_hidden_state", None)
 
     # ---------------------------------------------------------------- #
     # 前向：input_ids (1, q) + cache_position (q,) → logits (1, q, vocab)
@@ -573,12 +743,23 @@ class KvCacheWrapper(nn.Module):
         # Qwen3.5 的 TextModel 忽略 cache_position、用 get_seq_length() 推位置
         #（混合 cache 下不可靠），必须显式传 position_ids；llama 系模型收到
         # 一致的 position_ids 也无副作用。
-        out = self.inner(input_ids=ids, position_ids=positions, cache_position=cache_position,
-                         attention_mask=mask, past_key_values=self._cache, use_cache=True)
-        # 输出切回真实长度。不能直接 logits[:, :q]：动态 end 的 slice 在 end 可
-        # 等于维度上限时（q = max_seq_len 合法输入）会生成 "end != size" 守卫，
-        # 违反 1..max 动态范围声明，导出报错。先 cat 一列 dummy 使维度上限变为
-        # max+1，切片 end 恒小于上限，守卫静态成立、不会加入图约束。
-        logits = out.logits
-        dummy = torch.zeros((1, 1, logits.shape[-1]), dtype=logits.dtype, device=dev)
-        return torch.cat([logits, dummy], dim=1)[:, :q]
+        hidden = self._hidden_states(ids, positions, cache_position, mask)
+        if hidden is None:  # 拿不到主干（非常规 CausalLM 结构）：退回整图算 logits
+            out = self.inner(input_ids=ids, position_ids=positions,
+                             cache_position=cache_position, attention_mask=mask,
+                             past_key_values=self._cache, use_cache=True)
+            hidden = out.logits
+            head = None
+        else:
+            head = self.inner.lm_head
+        # 切回真实长度。不能直接 hidden[:, :q]：动态 end 的 slice 在 end 可等于
+        # 维度上限时（q = max_seq_len 合法输入）会生成 "end != size" 守卫，违反
+        # 1..max 动态范围声明，导出报错。先 cat 一列 dummy 使维度上限变为 max+1，
+        # 切片 end 恒小于上限，守卫静态成立、不会加入图约束。
+        dummy = torch.zeros((1, 1, hidden.shape[-1]), dtype=hidden.dtype, device=dev)
+        hidden = torch.cat([hidden, dummy], dim=1)[:, :q]
+        # lm_head 逐位置独立，先切回真实长度再算 logits 与"先算整段再切"完全等价，
+        # 但后者要为 pad 位置也算一份 (max_seq_len, vocab) 的 logits——词表 248320、
+        # 长度 512 时单张量 fp32 达 508MB，是图里最大的中间结果，既白算 pad 部分
+        # 也容易让 ANE 执行计划构建失败（-14）。
+        return hidden if head is None else head(hidden)

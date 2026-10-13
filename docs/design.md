@@ -36,7 +36,7 @@ Python 包与命令行名为 `modconv`，macOS 应用与仓库名为 **MLX2CoreM
 | `main_window.py` | 界面构建、输入校验、信号接线、线程生命周期（关闭保护） |
 | `workers.py` | `ScanWorker` / `ConversionWorker`（QThread），回调 → Qt 信号桥接 |
 | `backend.py` | 后端探测：架构白名单 + 依赖探测 + MLX 量化检测，产出 `BackendPlan` |
-| `real_backend.py` | 真实转换后端：torch.export → coremltools（stateful mlprogram）→ 4-bit 压缩 → 元数据/Swift 示例 |
+| `real_backend.py` | 真实转换后端：权重布局归一化 → torch.export → coremltools（stateful mlprogram）→ 4-bit 压缩 → 元数据/Swift 示例 |
 | `kv_wrapper.py` | `KvCacheWrapper`：把 HF 模型包装为 (input_ids, cache_position) → logits 的状态模块 |
 | `converter.py` | 打包后端：流式拷贝权重 1:1 + Manifest（兜底，不可直接推理）；相对路径做越界校验，单文件读取失败跳过而非整体失败 |
 | `scanner.py` / `estimator.py` / `utils.py` | 目录扫描、输出预估（打包/真实两种口径）、格式化工具 |
@@ -47,6 +47,8 @@ Python 包与命令行名为 `modconv`，macOS 应用与仓库名为 **MLX2CoreM
 
 5 个阶段（MLX 量化模型多一步反量化，共 5；非量化 4）：
 
+0. **权重布局归一化**（按需，见 §3.1）：checkpoint 的权重名/形状与架构期望不符时，
+   另存一份纯 HF 布局的临时副本再加载；中间产物同样写在输出目录旁，`finally` 中清理；
 1. **反量化**（可选）：`mlx_lm.convert(dequantize=True)` 输出到临时目录，`finally` 中清理；
 2. **加载配置与权重**：`AutoConfig` + `AutoModelForCausalLM`（eager 注意力 + eager
    专家实现）。最大上下文长度 = 用户输入（先截断到 `max_position_embeddings`、
@@ -66,9 +68,84 @@ Python 包与命令行名为 `modconv`，macOS 应用与仓库名为 **MLX2CoreM
    重建（mlprogram 不能仅从 spec 重建；重建后旧模型连同其临时权重目录一起释放）
    → 保存 `.mlpackage` + 生成 Swift 示例。
 
+**执行计划构建失败（-14）的自动收敛（阶段 3–5 整体可重试）**：ANE 能否构建执行
+计划既无文档也无先验公式，只能实测。Qwen3.5-0.8B 在本机的实测结论：
+
+| 配置 | 512 | 256 | 128 | 64 |
+|---|---|---|---|---|
+| 转换（单独编译） | 通过 | 通过 | 通过 | — |
+| 4-bit 量化后 | -14 | -14 | -14 | **通过** |
+| 未量化 | 通过 | — | — | — |
+
+即：**4-bit palettization 才是主导因素**（量化后的图在 512/256/128 都构建不了计划，
+未量化时这些长度都能过；fp16 加载把权重内存减半也救不了量化场景）。因此"追踪 →
+转换 → 量化 → 重建"整段都可重试，降级候选按实测影响力排序（`_fallback_plans`）：
+
+1. 用户配置原样（量化 + 原长度）；
+2. 量化 + 长度减半——给"缩短上下文就能过"的机型/模型一次机会；
+3. **取消量化并回到原长度**：实测 4-bit 图才是 -14 的主因，而上下文砍到 64 基本
+   没法用，所以宁可输出体积更大的未量化模型；
+4. 仍未过，再逐级降长度（下限 64 且不低于架构下限），之后才按失败处理（§3.1）。
+
+所有降级都会写进日志，并附在结果消息里（`已由 512 自动降到 …` / `已改为未量化
+输出`），不会静默发生。注意这与"量化失败直接抛异常、禁止降级为全精度"并不冲突：
+那条针对的是 palettization 本身报错（说明配置有问题），而这里量化已成功，只是产物
+在 ANE 上跑不起来——交付一个能跑的大模型，严格优于交付一个跑不起来的小模型。
+
+**每构造一个 `MLModel` 都会构建一次执行计划**（大模型十几分钟），因此：
+- `ct.convert` 返回的模型默认就是 ANE 编译过的——它本身就是"这个长度的图能不能跑"
+  的判据，不需要再验一次；
+- 量化后 `palettize_weights` 内部也会重建并编译，同样作为判据（压缩后的图与转换
+  输出不同，必须重新判）；
+- 而写元数据后的"重建"**只为让改过的 spec 落盘**，预测能力毫无必要，故显式传
+  `compute_units=CPU_ONLY` 跳过 ANE 编译——省掉十几分钟，也避免一次纯粹由内存
+  紧张引起的误报（落盘内容不含计算单元信息，产物完全相同）。
+
+**临时包必须显式删除**（`_drop_package`）：`ct.convert` 与 `MLModel(spec, weights_dir=…)`
+都会在系统临时目录下生成一份完整包（大模型上 GB 级），而 coremltools 只在**进程正常
+退出**时（atexit）清理。GUI 是长驻进程：连续转换会一直堆积，-14 重试时甚至同时存在
+数份——既吃磁盘也干扰后续编译。因此重建完成、重试切换、保存落盘后都立即删除旧包
+（只删 coremltools 自己标记为 `is_temp_package` 的包，用户传入的目录不动）。
+
 任何阶段失败抛异常，`ConversionWorker` 捕获后**直接向用户报错**——不回退打包后端
 （打包产物不是可推理的 Core ML 模型，静默降级会掩盖失败）。只有在 `probe_backend`
 阶段就判定"依赖缺失或架构不支持"时才走打包后端。
+
+同理，coremltools 遇到**编译不过的模型并不抛异常**，只发一条
+`RuntimeWarning: You will not be able to run predict() ... error code: -14` 就照常
+返回对象。若不拦住，界面会显示"转换完成"，交付的却是一个跑不起来的模型。因此
+重建 `MLModel` 时用 `warnings.catch_warnings` 捕获该告警：命中即**判定失败**
+（产物照常落盘便于排查，但明确告知不可用，并建议减小上下文长度或关闭量化）。
+
+转换期 coremltools 还会为每个 int64 → int32 的常量降级发一条
+`might lose precision` 告警（torch 的 scatter/gather 索引必须是 int64，ANE 只吃
+int32），大模型可达数万条、把日志刷满。这些常量都是远小于 2³¹ 的索引，降级无损，
+故在 `coremltools` logger 上挂过滤规则丢弃。
+
+### 3.1 权重布局归一化（加载前的强制校验）
+
+MLX 生态的 checkpoint 未必是 transformers 能直接加载的布局，两类差异必须修正：
+
+1. **多模态（复合）前缀**：MLX 的多模态布局把文本模型放在 `language_model.` 之下
+   （并带有 `vision_tower.*`），而 `AutoModelForCausalLM` 期望 `model.layers.*`；
+2. **Conv1d 权重轴序**：MLX 的 `Conv1d` 权重是 `(out, kernel, in)`，PyTorch 是
+   `(out, in, kernel)`。GDN / linear attention 的 conv1d 权重因此要么形状对不上而
+   直接报错，要么在两维恰好相等时被**静默当成正确权重**加载。mlx-lm 的
+   `convert`（含量化模型的反量化）不做这一步转换。
+
+关键在于：**名字对不上时 transformers 不会报错**，它把所有权重"新建初始化"，
+于是转换"成功"、产出的却是一个随机权重的模型。因此加载前必须先校验：
+
+- `_expected_state_shapes`：在 **meta 设备**上搭骨架取期望的名字与形状（0.8B 约 0.2s，
+  不分配真实内存）；
+- `_checkpoint_tensor_shapes`：只读 safetensors 头部取 checkpoint 的名字与形状；
+- `_resolve_weight_layout`：选出匹配的前缀，并按"期望形状 = checkpoint 形状交换
+  后两维"判定需要转置的张量；重合比例低于阈值时返回 `None` → **中止转换并报错**；
+- 需要归一化时 `_write_text_checkpoint` 逐分片另存（内存约等于一个分片），
+  只保留文本权重，`vision_tower.*` 一并丢弃。
+
+布局已经匹配时这一整套检查为零成本（不读权重数据、不落盘），只有真的不匹配才
+产生一份临时副本。
 
 ## 4. Stateful KV cache 设计（kv_wrapper.py）
 
@@ -97,6 +174,11 @@ Python 包与命令行名为 `modconv`，macOS 应用与仓库名为 **MLX2CoreM
   替换为静态批量前向：把 (token, top-k 槽位) 展平成 S = T×k 行 → 按 expert id
   gather 权重 → batched matmul → reshape 回 (T, k, H) 求和。与原版逐专家累加
   **逐位等价**（未选中专家的路由权重恒为 0），且只对 top-k 命中的专家计算。
+- **混合架构先切 hidden 再算 lm_head**：pad 到 `max_seq_len` 只为静态化 GDN 分块
+  循环，输出只取前 q 个位置。若先算 `(1, max_seq_len, vocab)` 再切片，会为 pad
+  位置也算一整份 logits（词表 248320、长度 512 时 fp32 下 508MB），是全图最大的
+  中间结果，既浪费算力也容易让 ANE 执行计划构建失败（-14）。`lm_head` 逐位置独立，
+  改为先切 hidden（`H` 维而非词表维）再算 logits，与原实现**数值等价**。
 - **导出要点**：
   - 示例长度 ≥2（`min(max_seq_len, 4)`）：torch.export 会把尺寸为 1 的维度特化为常量；
   - 导出包在 `torch.no_grad()`：参数 requires_grad 时 buffer 的 in-place 变异会被
@@ -126,20 +208,36 @@ Python 包与命令行名为 `modconv`，macOS 应用与仓库名为 **MLX2CoreM
 - 关闭等待用 `_wait_for_thread`（小步 `wait` + `processEvents`）替代单次
   `wait(30s)`，避免主线程整段阻塞、窗口无法重绘；
 - 取消：`cancel()` 置标记，转换器在块间/阶段间检查（深度阶段如 mlx 反量化、
-  `ct.convert` 内部不可中断，取消在阶段边界生效）；
+  `ct.convert` 内部不可中断，取消在阶段边界生效）；量化阶段结束后还会再查一次，
+  否则在最长阶段里点的取消会被忽略、一路走到保存；
 - **关闭保护**（`closeEvent`）：转换运行中先 `cancel()` 并等待至多 30s，超时则拒绝
   关闭（避免销毁运行中的 QThread 导致进程崩溃）；扫描线程先 `cancel()` 再等待至多 3s，
   同样检查返回值；线程判活用 `_thread_alive()` 兼容 C++ 对象已被 `deleteLater` 销毁的情况；
-- 退出线程引用保留在 `_retired_workers`（上限 5 个），配合 `finished → deleteLater`
-  防止 QThread 运行中被 GC。
+- **线程引用模型**：`ScanWorker` / `ConversionWorker` 继承 `_TrackedThread`，
+  `start()` 时登记到模块级集合、线程真正结束后（`finished` 已在主线程派发）注销。
+  QThread 在运行中被销毁会触发 Qt 的 `qFatal` → 进程直接 abort，Python 层无法捕获，
+  因此不能把"调用方记得保留引用"当作前提（局部变量出作用域即可被 GC）；
+- 转换线程分两层持有：`_conv_workers` 保存**所有尚未退出**的线程（在 `finished`
+  时移除），`_conv_worker` 只指向"当前这次"。`conversion_finished` 是在线程 `run()`
+  内部发出的，随后线程还要再跑几毫秒——只看 `_conv_worker` 会漏掉这段窗口期，
+  导致关闭窗口时销毁仍在运行的线程、或重复启动两个转换线程。不再用退役列表长期
+  保留已结束的 worker（它们攥着整份 `FileInfo` 清单，大目录上是实打实的内存滞留）；
+- 新扫描开始前先取消在飞的旧扫描（结果已因 `_scan_gen` 递增而作废，继续跑只会
+  抢磁盘带宽）。
 
 ## 6. 内存与性能
 
 - 扫描/打包拷贝均为流式（扫描只 stat；打包 4 MiB 块），内存占用与文件大小无关；
+- 扫描用 `os.scandir` + 显式栈遍历：`DirEntry` 自带 d_type，判定符号链接/目录通常
+  不需要系统调用，每个文件只剩一次 stat（原 `os.walk` + `Path` 写法是两次 stat
+  再加一次 `relative_to` 字符串运算）；文件名排序保证结果与文件系统返回顺序无关；
 - 打包进度按 16 MiB 字节间隔节流，扫描每 256 个文件回报，避免事件洪泛；
-- 真实转换：量化模型反量化后以 fp16 加载（内存减半）；`ct.convert` 完成后立即
-  释放 torch 侧模型与导出图（大模型数十 GB）再进入量化/保存阶段；4-bit 压缩后
-  再释放压缩前的模型对象及其临时权重目录；
+- 真实转换：量化模型反量化后以 fp16 加载（内存减半）；一律带 `low_cpu_mem_usage`
+  就地载入权重（省掉"先随机初始化再整体覆盖"的一倍峰值内存，老版本 transformers
+  不认该参数时逐级降级）；追踪结束后先取出 state 元信息再**丢弃 wrapper + HF 模型**
+  （`wrapper.inner` 就是 model，只 del 局部变量释放不掉），`ct.convert` 完成后立即
+  释放导出图（大模型数十 GB）再进入量化/保存阶段；4-bit 压缩后再释放压缩前的
+  模型对象及其临时权重目录；
 - 4-bit palettization 受 coremltools `weight_threshold`（2048 元素）约束，
   小权重自动跳过；
 - 真实转换的阶段进度以 `file_progress` 信号上报（relpath = "阶段 i/total"），
@@ -175,7 +273,11 @@ Python 包与命令行名为 `modconv`，macOS 应用与仓库名为 **MLX2CoreM
   仅作为依赖缺失时的兜底产物；
 - 输出体积预估（GUI "预计 Core ML 输出"）按后端口径分别估算：架构受支持时按
   fp16 + 4-bit 折算（未计入 LUT / Manifest 等固定开销，系统性偏低），否则按打包
-  1:1，仅供粗略参考。
+  1:1，仅供粗略参考；
+- 多模态（VL）checkpoint 只转换其**文本 LM**部分：`vision_tower.*` 权重被丢弃，
+  产出的是纯文本模型；
+- 权重布局不匹配时（见 §3.1）需要额外写出一份与源权重等大的临时副本，
+  占用同等磁盘空间（仍写在输出目录旁）。
 - 分发包是**启动器形态**的 `.app`，不内嵌 torch / transformers / coremltools
   （合计 2–4 GB 且与 Python 版本强绑定），需要宿主 Python 环境（见 §9）。
 

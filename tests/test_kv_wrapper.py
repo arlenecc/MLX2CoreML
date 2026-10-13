@@ -26,15 +26,17 @@ def _tiny_model():
 
 
 def test_wrapper_state_specs():
+    """全部层的 K/V 合并为单个 state（每层独立 state 会撞上 ANE 的数量上限）。"""
     from modconv.kv_wrapper import KvCacheWrapper
     wrapper = KvCacheWrapper(_tiny_model(), MAX_SEQ)
     names = [name for name, _, _ in wrapper.kv_state_specs()]
-    assert names == ["cache_0_k", "cache_0_v", "cache_1_k", "cache_1_v"]
+    assert names == ["kv_all"]
+    # (full 层数, K/V, kv 头数, max_seq_len, head_dim)
     for name, shape, dtype in wrapper.kv_state_specs():
-        assert tuple(shape) == (1, 2, MAX_SEQ, 8)
+        assert tuple(shape) == (2, 2, 2, MAX_SEQ, 8)
         assert dtype == "float16"
     for buf in wrapper.state_buffers():
-        assert tuple(buf.shape) == (1, 2, MAX_SEQ, 8)
+        assert tuple(buf.shape) == (2, 2, 2, MAX_SEQ, 8)
 
 
 def test_prefill_and_decode_parity_with_hf():
@@ -112,16 +114,20 @@ def _tiny_qwen35_model():
 
 
 def test_qwen35_hybrid_state_specs():
+    """混合架构同样合并 state：full 层 K/V 一个、GDN 层 conv/rec 各一个。"""
     from modconv.kv_wrapper import KvCacheWrapper
     wrapper = KvCacheWrapper(_tiny_qwen35_model(), MAX_SEQ)
-    names = [name for name, _, _ in wrapper.kv_state_specs()]
-    # linear 层用 conv/rec state，full 层用 K/V；顺序与 named_buffers 一致
-    assert names == ["cache_1_k", "cache_1_v", "cache_3_k", "cache_3_v",
-                     "cache_0_conv", "cache_0_rec", "cache_2_conv", "cache_2_rec"]
-    for name, shape, dtype in wrapper.kv_state_specs():
+    specs = wrapper.kv_state_specs()
+    names = [name for name, _, _ in specs]
+    assert names == ["kv_all", "conv_all", "rec_all"]
+    shapes = {name: tuple(shape) for name, shape, _ in specs}
+    # 4 层里 2 层 full attention（层 1/3）→ kv_all 第 0 维为 2
+    assert shapes["kv_all"] == (2, 2, 2, MAX_SEQ, 8)
+    # 2 层 GDN（层 0/2）→ conv/rec 的第 0 维为 2；conv 末维是卷积核大小
+    assert shapes["conv_all"][0] == 2 and len(shapes["conv_all"]) == 3
+    assert shapes["rec_all"][0] == 2
+    for _, _, dtype in specs:
         assert dtype == "float16"
-        if name.endswith(("_k", "_v")):
-            assert tuple(shape) == (1, 2, MAX_SEQ, 8)
     assert wrapper.state_buffers()
 
 
