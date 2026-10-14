@@ -30,6 +30,10 @@ let TOK_HELPER: String = {
 
 let MAX_SEQ: Int32 = 8192
 
+// 重复惩罚：对提示 + 已生成 token 降权，抑制贪心解码下 "- **Ask**:" 这类循环退化。
+// 1.0 = 关闭；1.1~1.3 常用，1.15 在连贯与多样间较平衡。
+let REPETITION_PENALTY: Float = 1.15
+
 // Qwen3.5 特殊 token 与基础词表大小（用于 decode 停止 / 避开填充区）
 let TOK_IM_START: Int32 = 248045
 let TOK_IM_END:   Int32 = 248046
@@ -87,13 +91,20 @@ func forwardWithConvertedModel(
     return (logits, newStates)
 }
 
-func argmaxFromLogits(_ logits: MLMultiArray, vocab: Int) -> Int32 {
+func argmaxFromLogits(_ logits: MLMultiArray, vocab: Int,
+                       penalty: Float = 1.0, penalized: Set<Int32>? = nil) -> Int32 {
     let v = min(vocab, logits.shape.last?.intValue ?? 0)
     guard v > 0 else { return 0 }
     var best = 0, bestVal = -Double.greatestFiniteMagnitude
     let base = logits.count - v
+    let p = Double(penalty)
     for i in 0..<v {
-        let val = logits[base + i].doubleValue
+        var val = logits[base + i].doubleValue
+        // 重复惩罚（Fan et al.）：对上下文已出现过的 token 降权，抑制循环生成。
+        // 正值除以 p、负值乘以 p，与 transformers 的 repetition_penalty 一致。
+        if p != 1.0, let set = penalized, set.contains(Int32(i)) {
+            val = val > 0 ? val / p : val * p
+        }
         if val > bestVal { bestVal = val; best = i }
     }
     return Int32(best)
@@ -253,14 +264,18 @@ final class ChatController: ObservableObject {
 
             // 3) 自回归生成回复（decode）；遇到 eos/特殊 token/填充区即停止
             var gen: [Int32] = []
+            var ctx: [Int32] = ids   // 提示 + 已生成 token，作为重复惩罚上下文
             for _ in 0..<maxNew {
                 guard let cur = lastLogits else { break }
-                let nxt = argmaxFromLogits(cur, vocab: vocab)
+                let penalized = Set(ctx)
+                let nxt = argmaxFromLogits(cur, vocab: vocab,
+                                           penalty: REPETITION_PENALTY, penalized: penalized)
                 // id >= 基础词表(248044) 均为特殊/填充 token（含 <|im_end|>=248046、<|endoftext|>=248044）
                 if Int(nxt) >= TOKENIZER_VOCAB { break }
                 gen.append(nxt)
                 let out = try forwardWithConvertedModel(m, st, token: nxt, position: pos, gdnStates: gdnStates)
                 gdnStates = out.newStates; lastLogits = out.logits; pos += 1
+                ctx.append(nxt)
             }
             let t2 = Date()
             let decodeMs = t2.timeIntervalSince(t1) * 1000
