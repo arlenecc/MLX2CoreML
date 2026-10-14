@@ -47,9 +47,9 @@ enum ConvertedModelError: Error { case missingOutput(String) }
 /// 先调用 compileModel 生成 .mlmodelc（把模型加入 Xcode 工程时，Xcode 会在构建期
 /// 自动完成这一步，此时直接传 Bundle 里的 URL 即可，本函数会原样使用）。
 /// 返回 (模型, 编译缓存URL)；该缓存须在任务结束后清理以释放磁盘。
-func loadConvertedModel(_ modelURL: URL) throws -> (model: MLModel, compiled: URL?) {
+func loadConvertedModel(_ modelURL: URL, computeUnits: MLComputeUnits = .all) throws -> (model: MLModel, compiled: URL?) {
     let configuration = MLModelConfiguration()
-    configuration.computeUnits = .all
+    configuration.computeUnits = computeUnits
     let compiled: URL?
     let url: URL
     if modelURL.pathExtension == "mlpackage" {
@@ -137,6 +137,7 @@ final class ChatController: ObservableObject {
     private var selectedURL: URL?   // 用户通过文件选择框选中的模型路径
     private var selectedTokenizerURL: URL?   // 用户通过文件选择框选中的 tokenizer.json 路径
     private var pos: Int32 = 0   // 当前序列长度（跨轮持续累加，KV cache 不重置）
+    var selectedComputeUnit: MLComputeUnits = .all   // 加载时使用的计算单元（UI 下拉选择，便于对比 ANE/GPU/CPU 速度）
 
     /// 用户在文件夹选择框选中模型后调用：仅记录路径并更新显示，不立即加载。
     func select(url: URL) {
@@ -165,13 +166,14 @@ final class ChatController: ObservableObject {
     func load(url: URL) {
         modelName = url.lastPathComponent
         let path = url.path
+        let cu = self.selectedComputeUnit   // 主线程捕获，避免后台读取竞态
         guard !path.isEmpty else { return }
         DispatchQueue.main.async { self.status = "加载中（首次 ANE 特化可能需 1–2 分钟）…" }
         DispatchQueue.global(qos: .userInitiated).async {
             self.clearPreviousCompiledCache()   // 切换/重载前先删掉上一模型的编译缓存
             do {
                 let url = URL(fileURLWithPath: path)
-                let (m, compiled) = try loadConvertedModel(url)
+                let (m, compiled) = try loadConvertedModel(url, computeUnits: cu)
                 var gs: [String: MLMultiArray] = [:]
                 for (n, d) in m.modelDescription.inputDescriptionsByName {
                     if n.hasSuffix("_states"), let shape = d.multiArrayConstraint?.shape {
@@ -196,7 +198,7 @@ final class ChatController: ObservableObject {
                     self.compiledURL = compiled   // 记录编译缓存路径，便于退出时清理
                     self.loaded = true
                     self.loadedName = url.lastPathComponent
-                    self.status = "已加载：\(url.lastPathComponent)｜vocab=\(vocab)"
+                    self.status = "已加载：\(url.lastPathComponent)｜vocab=\(vocab)｜device=\(self.computeUnitLabel(cu))"
                 }
             } catch {
                 DispatchQueue.main.async { self.status = "加载失败：\(error)"; self.loaded = false }
@@ -348,6 +350,17 @@ final class ChatController: ObservableObject {
         transcript = "（对话已清空，记忆已重置）\n"
     }
 
+    /// 计算单元枚举 → 中文标签，用于状态栏展示当前加载所用设备。
+    private func computeUnitLabel(_ u: MLComputeUnits) -> String {
+        switch u {
+        case .all:                 return "自动(ANE+GPU+CPU)"
+        case .cpuAndGPU:           return "仅GPU+CPU"
+        case .cpuAndNeuralEngine:  return "仅ANE+CPU"
+        case .cpuOnly:             return "仅CPU"
+        @unknown default:          return "未知"
+        }
+    }
+
     private func append(_ s: String) {
         DispatchQueue.main.async { self.transcript += s }
     }
@@ -394,6 +407,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusLabel: NSTextField!
     private var promptField: NSTextField!
     private var maxNewStepper: NSStepper!
+    private var computeUnitPopup: NSPopUpButton!
     private var maxNewLabel: NSTextField!
     private var sendButton: NSButton!
     private var resetButton: NSButton!
@@ -437,6 +451,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tokRow.addArrangedSubview(selectTokButton)
         tokRow.addArrangedSubview(tokenizerLabel)
 
+        // 计算设备下拉：加载前选择 ANE/GPU/CPU 组合，便于直观对比不同后端的速度。
+        // 默认「自动」，与 modconv 的 ANE 取向一致；也可选「仅 GPU+CPU」排除 ANE。
+        let computeRow = NSStackView(); computeRow.orientation = .horizontal; computeRow.spacing = 8
+        let computeLabel = NSTextField(labelWithString: "计算设备:")
+        computeLabel.font = NSFont.systemFont(ofSize: 11)
+        computeUnitPopup = NSPopUpButton()
+        computeUnitPopup.addItems(withTitles: ["自动 (ANE+GPU+CPU)", "仅 GPU+CPU", "仅 ANE+CPU", "仅 CPU"])
+        computeUnitPopup.target = self
+        computeUnitPopup.action = #selector(computeUnitChanged(_:))
+        computeRow.addArrangedSubview(computeLabel)
+        computeRow.addArrangedSubview(computeUnitPopup)
+
         let row2 = NSStackView(); row2.orientation = .horizontal; row2.spacing = 8
         maxNewLabel = NSTextField(labelWithString: "每轮生成上限: 64")
         maxNewStepper = NSStepper()
@@ -473,6 +499,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         root.addArrangedSubview(row1)
         root.addArrangedSubview(tokRow)
+        root.addArrangedSubview(computeRow)
         root.addArrangedSubview(row2)
         root.addArrangedSubview(statusLabel)
         root.addArrangedSubview(scroll)
@@ -569,6 +596,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func stepperChanged(_ sender: Any) {
         maxNewLabel.stringValue = "每轮生成上限: \(maxNewStepper.integerValue)"
+    }
+    /// 计算设备下拉：把选中项映射到 MLComputeUnits，供下次「加载模型」使用。
+    @objc private func computeUnitChanged(_ sender: Any) {
+        let units: [MLComputeUnits] = [.all, .cpuAndGPU, .cpuAndNeuralEngine, .cpuOnly]
+        let idx = computeUnitPopup.indexOfSelectedItem
+        guard idx >= 0, idx < units.count else { return }
+        controller.selectedComputeUnit = units[idx]
     }
     @objc private func sendTapped(_ sender: Any) {
         let text = promptField.stringValue
