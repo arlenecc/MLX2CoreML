@@ -168,7 +168,8 @@ final class ChatController: ObservableObject {
         let path = url.path
         let cu = self.selectedComputeUnit   // 主线程捕获，避免后台读取竞态
         guard !path.isEmpty else { return }
-        DispatchQueue.main.async { self.status = "加载中（首次 ANE 特化可能需 1–2 分钟）…" }
+        let devHint = self.computeUnitLabel(cu)
+        DispatchQueue.main.async { self.status = "加载中（首次编译/特化可能需 1–2 分钟，device=\(devHint)）…" }
         DispatchQueue.global(qos: .userInitiated).async {
             self.clearPreviousCompiledCache()   // 切换/重载前先删掉上一模型的编译缓存
             let fileURL = URL(fileURLWithPath: path)
@@ -324,8 +325,14 @@ final class ChatController: ObservableObject {
             return ChatResult(reply: reply, genTokens: gen.count, prefillTokens: ids.count,
                               prefillMs: prefillMs, decodeMs: decodeMs)
         } catch {
-            return ChatResult(reply: "推理出错：\(error)", genTokens: 0, prefillTokens: 0,
-                              prefillMs: 0, decodeMs: 0)
+            // 推理错误（如所选设备缺少某算子的 GPU/CPU 内核）写到日志，便于诊断；
+            // 对话区同时给出完整信息，避免「加载成功却不能用」却看不到原因。
+            let detail = "\(error)"
+            let msg = "推理出错：\(detail)"
+            try? detail.write(toFile: "/tmp/modconv_gui_infer_error.log",
+                             atomically: true, encoding: .utf8)
+            return ChatResult(reply: msg + "\n（详情见 /tmp/modconv_gui_infer_error.log）",
+                              genTokens: 0, prefillTokens: 0, prefillMs: 0, decodeMs: 0)
         }
     }
 
