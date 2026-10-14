@@ -13,6 +13,7 @@ import CoreML
 import Dispatch
 import Foundation
 import Combine
+import UniformTypeIdentifiers
 
 // 模型改为运行时选取：点「选择模型」弹出文件夹选择框，选中 .mlpackage（或已编译的
 // .mlmodelc）后点「加载模型」即载入。不再内置固定路径下拉。
@@ -126,13 +127,15 @@ final class ChatController: ObservableObject {
     @Published var loadedName = ""  // 已加载模型名
     @Published var transcript = "对话将在模型加载后开始。\n在下方输入内容并点「发送」即可体验多轮对话。\n"
     @Published var running = false
+    @Published var tokenizerName = ""   // 已选分词器文件名（空 = 用 tok_helper.py 默认）
 
     private var model: MLModel?
     private var state: MLState?
     private var gdnStates: [String: MLMultiArray] = [:]
     private var vocab: Int = 0
     private var compiledURL: URL?   // 最近一次 compileModel 生成的 .mlmodelc，退出时清理
-    private var selectedURL: URL?   // 用户通过文件夹选择框选中的模型路径
+    private var selectedURL: URL?   // 用户通过文件选择框选中的模型路径
+    private var selectedTokenizerURL: URL?   // 用户通过文件选择框选中的 tokenizer.json 路径
     private var pos: Int32 = 0   // 当前序列长度（跨轮持续累加，KV cache 不重置）
 
     /// 用户在文件夹选择框选中模型后调用：仅记录路径并更新显示，不立即加载。
@@ -140,6 +143,14 @@ final class ChatController: ObservableObject {
         selectedURL = url
         modelName = url.lastPathComponent
         status = "已选择：\(url.lastPathComponent)｜点「加载模型」载入"
+    }
+
+    /// 用户选中 tokenizer.json 后调用：记录路径，encode/decode 时通过
+    /// MODCONV_TOKENIZER 环境变量传给 tok_helper.py，与所选模型配合。
+    func selectTokenizer(url: URL) {
+        selectedTokenizerURL = url
+        tokenizerName = url.lastPathComponent
+        status = "已选分词器：\(url.lastPathComponent)（与所选模型配合）"
     }
 
     /// 点「加载模型」时调用：加载当前选中的模型文件夹。
@@ -354,6 +365,13 @@ final class ChatController: ObservableObject {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: PYTHON)
         p.arguments = args
+        // 用户显式选了 tokenizer.json 时，通过环境变量传给 tok_helper.py；
+        // 否则不设置，沿用 tok_helper.py 自身的默认/环境变量。
+        if let tok = selectedTokenizerURL {
+            var env = ProcessInfo.processInfo.environment
+            env["MODCONV_TOKENIZER"] = tok.path
+            p.environment = env
+        }
         let out = Pipe(), err = Pipe()
         p.standardOutput = out; p.standardError = err
         try p.run(); p.waitUntilExit()
@@ -371,6 +389,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var selectButton: NSButton!
     private var loadButton: NSButton!
     private var selectedPathLabel: NSTextField!
+    private var selectTokButton: NSButton!
+    private var tokenizerLabel: NSTextField!
     private var statusLabel: NSTextField!
     private var promptField: NSTextField!
     private var maxNewStepper: NSStepper!
@@ -408,6 +428,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         row1.addArrangedSubview(loadButton)
         row1.addArrangedSubview(resetButton)
 
+        let tokRow = NSStackView(); tokRow.orientation = .horizontal; tokRow.spacing = 8
+        selectTokButton = NSButton(title: "选择分词器", target: self, action: #selector(selectTokTapped(_:)))
+        tokenizerLabel = NSTextField(labelWithString: "（默认 tokenizer）")
+        tokenizerLabel.font = NSFont.systemFont(ofSize: 11)
+        tokenizerLabel.textColor = .secondaryLabelColor
+        tokenizerLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        tokRow.addArrangedSubview(selectTokButton)
+        tokRow.addArrangedSubview(tokenizerLabel)
+
         let row2 = NSStackView(); row2.orientation = .horizontal; row2.spacing = 8
         maxNewLabel = NSTextField(labelWithString: "每轮生成上限: 64")
         maxNewStepper = NSStepper()
@@ -443,6 +472,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputRow.addArrangedSubview(sendButton)
 
         root.addArrangedSubview(row1)
+        root.addArrangedSubview(tokRow)
         root.addArrangedSubview(row2)
         root.addArrangedSubview(statusLabel)
         root.addArrangedSubview(scroll)
@@ -487,6 +517,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.$modelName.receive(on: RunLoop.main).sink { [weak self] n in
             self?.selectedPathLabel.stringValue = n.isEmpty ? "（未选择模型文件）" : "已选: \(n)"
         }.store(in: &cancellables)
+        controller.$tokenizerName.receive(on: RunLoop.main).sink { [weak self] n in
+            self?.tokenizerLabel.stringValue = n.isEmpty ? "（默认 tokenizer）" : "分词器: \(n)"
+        }.store(in: &cancellables)
         controller.$loaded.receive(on: RunLoop.main).sink { [weak self] _ in self?.updateUI() }.store(in: &cancellables)
         controller.$running.receive(on: RunLoop.main).sink { [weak self] _ in self?.updateUI() }.store(in: &cancellables)
         controller.$modelName.receive(on: RunLoop.main).sink { [weak self] _ in self?.updateUI() }.store(in: &cancellables)
@@ -516,6 +549,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func loadTapped(_ sender: Any) {
         controller.loadSelected()
+    }
+    /// 弹出文件选择框：选中与所选模型同族的 tokenizer.json。
+    @objc private func selectTokTapped(_ sender: Any) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.json]
+        panel.message = "选择 tokenizer.json（须与所选模型同族）"
+        panel.beginSheetModal(for: self.window) { [weak self] resp in
+            guard resp == .OK, let url = panel.url else { return }
+            self?.controller.selectTokenizer(url: url)
+        }
     }
     @objc private func resetTapped(_ sender: Any) {
         controller.resetConversation()
