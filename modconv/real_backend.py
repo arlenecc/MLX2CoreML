@@ -31,6 +31,8 @@ import threading
 import time
 import uuid
 import warnings
+import atexit
+import signal
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +41,85 @@ from typing import Callable, Optional
 from modconv.converter import ConversionResult
 # ATTENTION_LAYER_TYPES：混合注意力架构的层类型名单，与 kv_wrapper 共用同一份
 from modconv.utils import ATTENTION_LAYER_TYPES, format_size
+
+# ---------------------------------------------------------------------------
+# 临时产物兜底清理
+#
+# 转换过程会产生 GB 级的临时包：反量化/归一化的权重目录（可达数十 GB）、
+# 以及 coremltools 在系统临时目录下生成的临时 .mlpackage。正常流程里它们由
+# 调用点的 finally（`tmp_dirs`）与显式 `_drop_package` 删除；但若进程**异常
+# 退出**（崩溃抛异常、被 SIGTERM / kill、未走到 finally），coremltools 自带的
+# atexit 清理在长驻 GUI 进程里不可靠，临时包会残留并很快吃满启动盘。
+#
+# 这里用模块级集合记录所有待清理路径，并在以下两种情况强制兜底删除：
+#   1) 进程正常退出 / 抛未捕获异常 / Ctrl-C —— atexit 钩子；
+#   2) 收到 SIGTERM / SIGINT —— 终止信号处理器（清完再恢复原处置，
+#      让进程仍按预期退出，不改变原有信号语义）。
+# ---------------------------------------------------------------------------
+_PENDING_CLEANUP: set = set()
+
+
+def _register_pending(path) -> None:
+    """登记一个待清理的临时路径（目录或文件），进程异常退出时兜底删除。"""
+    try:
+        if path is None:
+            return
+        _PENDING_CLEANUP.add(str(path))
+    except Exception:
+        pass
+
+
+def _unregister_pending(path) -> None:
+    """正常删除后从待清理集合移除，避免重复操作。"""
+    try:
+        _PENDING_CLEANUP.discard(str(path))
+    except Exception:
+        pass
+
+
+def _track_temp_package(model_obj) -> None:
+    """若 model_obj 是 coremltools 的临时包，登记其路径以便异常退出时兜底清理。"""
+    if getattr(model_obj, "is_temp_package", False):
+        _register_pending(getattr(model_obj, "package_path", None))
+
+
+def _cleanup_pending() -> None:
+    """删除所有仍登记的临时路径（幂等、忽略一切错误）。"""
+    for p in list(_PENDING_CLEANUP):
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p, ignore_errors=True)
+            elif os.path.lexists(p):
+                os.remove(p)
+        except Exception:
+            pass
+    _PENDING_CLEANUP.clear()
+
+
+atexit.register(_cleanup_pending)
+
+
+def _on_fatal_signal(signum, _frame):
+    """收到终止信号时先清临时包，再恢复原处置让进程按预期退出。"""
+    try:
+        _cleanup_pending()
+    finally:
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        except Exception:
+            pass
+
+
+# 覆盖外部终止（kill / kill -TERM / 系统关机）；非主线程或平台不支持时跳过，
+# 不影响正常转换。SIGINT 同理（保留默认 Ctrl-C 行为：清完再让 KeyboardInterrupt 抛出）。
+for _sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+    if _sig is not None:
+        try:
+            signal.signal(_sig, _on_fatal_signal)
+        except (ValueError, OSError, RuntimeError):
+            pass
+
 
 SEQ_LEN_CAP = 512
 
@@ -59,6 +140,19 @@ _WEIGHT_MATCH_RATIO = 0.5
 # 复合（多模态）checkpoint 里文本 LM 权重的常见前缀：HF 侧期望 "model.layers.*"，
 # 而 MLX 的多模态布局把它们放在 "language_model." 之下（并带有 vision_tower.*）。
 _TEXT_WEIGHT_PREFIXES = ("", "language_model.", "model.language_model.")
+
+# Qwen3.5 系零中心 RMSNorm（HF 的 Qwen3_5RMSNorm 计算 1.0 + weight）的权重后缀，
+# 与 mlx-lm sanitize 折叠 +1.0 的名单逐条一致（mlx_lm/models/qwen3_5.py 的
+# norm_keys）。GDN 内部的 linear_attn.norm 是 Qwen3_5RMSNormGated（HF 侧本就不加
+# +1），不在此列——两侧约定相同，动它才会错。
+_FOLDED_NORM_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    "model.norm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+)
+_FOLDED_NORM_MODEL_TYPES = ("qwen3_5", "qwen3_5_text")
 
 _SWIFT_EXAMPLE_TEMPLATE = '''// 由 modconv 自动生成 — 模型 "{model_name}" 的 Swift 调用示例
 // 单步 decode 模型：每次前向推进**一个** token，prefill 由循环调用完成
@@ -278,10 +372,14 @@ def _make_dequant_tmp(output_dir: Optional[Path] = None) -> Path:
             base = Path(output_dir)
             base.mkdir(parents=True, exist_ok=True)
             if os.access(base, os.W_OK):
-                return base / name
+                path = base / name
+                _register_pending(path)
+                return path
         except OSError:
             pass
-    return Path(tempfile.gettempdir()) / name
+    path = Path(tempfile.gettempdir()) / name
+    _register_pending(path)
+    return path
 
 
 def _dequantize_mlx_model(source: Path, dest: Path, log: Callable[[str], None]) -> None:
@@ -399,13 +497,33 @@ def _resolve_weight_layout(want: dict, have: dict) -> Optional[tuple[str, set]]:
     return best, transposed
 
 
+def _needs_norm_unfolding(config, transposed: set) -> bool:
+    """checkpoint 是否为 mlx-lm 转换产物（RMSNorm 权重已预折叠 1+gain）。
+
+    判定与 mlx-lm 的 sanitize 互为镜像：那里只在 conv1d 为 PyTorch 布局
+    （未消毒）时才给 norm 权重 +1.0；这里 conv1d 需要转置（transposed 非空）
+    即说明 convert 时已消过毒——权重库里存的就是 1+gain。写回 HF 布局时
+    必须减掉这层折叠，否则 HF 的 Qwen3_5RMSNorm 会二次 +1（得 2+gain），
+    归一化尺度整体翻倍，输出乱码。RMSNormGated（GDN 内部）两侧都不加 +1，
+    不在此列。仅 Qwen3.5 系使用该零中心约定，其余模型不猜。
+    """
+    if not any("conv1d" in name for name in transposed):
+        return False
+    model_type = str(getattr(_text_config(config), "model_type", "") or "")
+    return model_type in _FOLDED_NORM_MODEL_TYPES
+
+
 def _write_text_checkpoint(source: Path, dest: Path, prefix: str, transposed: set,
+                           unfold_norms: bool,
                            log: Callable[[str], None]) -> None:
     """把文本权重另存为 HF 布局（去掉前缀 + 转置 conv1d 权重）。
 
     多模态 checkpoint 把文本模型放在 `language_model.` 之下并带有 vision_tower.*；
     这里只取该前缀的权重、去掉前缀另存，输出目录因此只有文本 LM，可被
     AutoModelForCausalLM 正常加载。逐分片读写，内存占用约等于一个分片。
+
+    unfold_norms：MLX 转换产物的 RMSNorm 权重已预折叠为 1+gain（见
+    _needs_norm_unfolding），逐键减 1.0 还原成 HF 零中心约定的原始 gain。
     """
     from safetensors import safe_open
     from safetensors.torch import save_file
@@ -425,14 +543,20 @@ def _write_text_checkpoint(source: Path, dest: Path, prefix: str, transposed: se
                         continue
                     tensor = handle.get_tensor(name)
                     key = name[len(prefix):]
-                    tensors[key] = (tensor.transpose(1, 2) if key in transposed
-                                    else tensor)
+                    if key in transposed:
+                        tensor = tensor.transpose(1, 2)
+                    if unfold_norms and key.endswith(_FOLDED_NORM_SUFFIXES):
+                        # 折叠值 1+gain → 原始 gain；经 fp32 中间量计算，避免
+                        # bf16 存储下 (1.2x - 1.0) 的二次舍入误差
+                        tensor = (tensor.float() - 1.0).to(tensor.dtype)
+                    tensors[key] = tensor
         except Exception:
             continue  # 分片损坏：交给加载阶段报错
         if not tensors:
             continue
         log(f"归一化权重分片 {shard.name}（{len(tensors)} 个张量"
-            f"{f'，转置 {len(transposed)} 个 conv1d 权重' if transposed else ''}）…")
+            f"{f'，转置 {len(transposed)} 个 conv1d 权重' if transposed else ''}"
+            f"{'，还原 RMSNorm 权重折叠' if unfold_norms else ''}）…")
         try:
             save_file(tensors, str(dest / shard.name), metadata={"format": "pt"})
         except Exception:
@@ -822,6 +946,7 @@ def _drop_package(model_obj) -> None:
     if not path:
         return
     shutil.rmtree(path, ignore_errors=True)
+    _unregister_pending(path)
 
 
 def _measure(path: Path) -> tuple[int, int]:
@@ -908,6 +1033,7 @@ class CoremltoolsBackend:
                 return finish(False, False, _layout_mismatch_message(torch_source),
                               None, 0, 0)
             prefix, transposed = layout
+            unfold_norms = _needs_norm_unfolding(config, transposed)
             if prefix or transposed:
                 if len(tmp_dirs) > 1:
                     # 已经归一化过一次仍对不上，这条路径救不回来
@@ -919,13 +1045,16 @@ class CoremltoolsBackend:
                 if transposed:
                     reasons.append(f"{len(transposed)} 个 conv1d 权重为 MLX 布局"
                                    "（out, kernel, in）")
+                if unfold_norms:
+                    reasons.append("RMSNorm 权重已预折叠 1+gain，将还原为 HF 的"
+                                   "零中心约定")
                 hooks.on_log("checkpoint 为 " + "、".join(reasons)
                              + "，正在另存为 HF 布局…")
                 # 与反量化产物同样放在输出目录旁：体积和源权重相当
                 norm_dir = _make_dequant_tmp(self.output_dir)
                 tmp_dirs.append(norm_dir)
                 _write_text_checkpoint(torch_source, norm_dir, prefix, transposed,
-                                       hooks.on_log)
+                                       unfold_norms, hooks.on_log)
                 torch_source = norm_dir
                 config = _load_config(torch_source, libs)
                 if hooks.should_cancel():
@@ -1050,6 +1179,7 @@ class CoremltoolsBackend:
                         compute_units=libs.ct.ComputeUnit.CPU_ONLY)
                 # 重建包自带权重副本，旧包（含其权重目录）到此无用，立即释放磁盘
                 _drop_package(model_obj)
+                _track_temp_package(rebuilt)
                 return rebuilt, bits, name, _unusable_model_message(caught)
 
             # 追踪 + 转换可能因 ANE -14 反复重试：第一次按目标长度走正常阶段提示，
@@ -1101,6 +1231,7 @@ class CoremltoolsBackend:
                     with _capture_ane_warnings() as caught:
                         mlmodel = _convert_to_coreml(libs, exported, state_specs,
                                                      traced_seq_len, gdn_state_specs)
+                        _track_temp_package(mlmodel)
                 finally:
                     heartbeat.stop()
                 ane_msg = _unusable_model_message(caught)

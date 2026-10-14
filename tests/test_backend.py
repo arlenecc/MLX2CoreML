@@ -431,7 +431,8 @@ def test_write_text_checkpoint_normalizes_prefix_and_conv(tmp_path):
     assert transposed == {"model.layers.0.linear_attn.conv1d.weight"}
 
     dest = tmp_path / "hf"
-    real_backend_mod._write_text_checkpoint(src, dest, prefix, transposed, lambda m: None)
+    real_backend_mod._write_text_checkpoint(src, dest, prefix, transposed, False,
+                                            lambda m: None)
     out = load_file(str(dest / "model.safetensors"))
     assert set(out) == set(want), "vision_tower 必须被丢弃"
     assert tuple(out["model.layers.0.linear_attn.conv1d.weight"].shape) == (2, 1, 4)
@@ -440,6 +441,81 @@ def test_write_text_checkpoint_normalizes_prefix_and_conv(tmp_path):
                        conv.flatten())
     assert torch.equal(out["model.embed_tokens.weight"], emb)
     assert json.loads((dest / "config.json").read_text())["model_type"] == "qwen3_5"
+
+
+def test_needs_norm_unfolding_only_for_mlx_sanitized_qwen35():
+    """只有 MLX 布局 conv1d + Qwen3.5 系的 checkpoint 才还原 norm 折叠。"""
+    from types import SimpleNamespace
+
+    needs = real_backend_mod._needs_norm_unfolding
+    conv = {"model.layers.0.linear_attn.conv1d.weight"}
+    qwen35 = SimpleNamespace(model_type="qwen3_5")
+    qwen35_text = SimpleNamespace(text_config=SimpleNamespace(model_type="qwen3_5_text"))
+    assert needs(qwen35, conv) is True
+    assert needs(qwen35_text, conv) is True
+    # conv1d 本就是 HF 布局（未消毒的原始 checkpoint）：norm 权重是原始 gain，不能动
+    assert needs(qwen35, set()) is False
+    # 其他架构即使有 MLX conv1d 也不猜（不共用零中心 RMSNorm 约定）
+    assert needs(SimpleNamespace(model_type="llama"), conv) is False
+
+
+def test_write_text_checkpoint_unfolds_qwen35_norms(tmp_path):
+    """MLX 转换产物：RMSNorm 权重存的是 1+gain，须减 1.0 还原。
+
+    HF 的 Qwen3_5RMSNorm 自己会加 1.0；不减这层折叠就是双重 +1（2+gain），
+    归一化尺度翻倍、输出乱码。GDN 内部的 linear_attn.norm 是 RMSNormGated，
+    HF 侧不加 +1，必须原样保留。
+    """
+    import torch
+    from safetensors.torch import load_file, save_file
+
+    src = tmp_path / "src"
+    src.mkdir()
+    folded = {
+        "language_model.model.layers.0.input_layernorm.weight":
+            torch.tensor([1.25, 0.75], dtype=torch.bfloat16),
+        "language_model.model.layers.3.self_attn.q_norm.weight":
+            torch.tensor([1.5, -0.5], dtype=torch.bfloat16),
+        "language_model.model.layers.3.self_attn.k_norm.weight":
+            torch.tensor([2.0, 0.0], dtype=torch.bfloat16),
+        "language_model.model.norm.weight":
+            torch.tensor([1.125], dtype=torch.bfloat16),
+        # GDN 内部 norm（RMSNormGated）：不折叠，严禁被动
+        "language_model.model.layers.0.linear_attn.norm.weight":
+            torch.tensor([0.3, -0.2], dtype=torch.bfloat16),
+        "language_model.model.layers.0.linear_attn.conv1d.weight":
+            torch.arange(8, dtype=torch.float32).reshape(2, 4, 1),
+    }
+    save_file(folded, str(src / "model.safetensors"), metadata={"format": "pt"})
+    (src / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}),
+                                     encoding="utf-8")
+
+    # want 模拟 HF 模型期望的布局：conv1d 为 (out, in, kernel)
+    want = {}
+    for k, v in folded.items():
+        key = k[len("language_model."):]
+        want[key] = ((v.shape[0], v.shape[2], v.shape[1]) if "conv1d" in key
+                     else tuple(v.shape))
+    prefix, transposed = real_backend_mod._resolve_weight_layout(
+        want, real_backend_mod._checkpoint_tensor_shapes(src))
+    unfold = real_backend_mod._needs_norm_unfolding(
+        types.SimpleNamespace(model_type="qwen3_5"), transposed)
+    assert prefix == "language_model." and unfold is True
+
+    dest = tmp_path / "hf"
+    real_backend_mod._write_text_checkpoint(src, dest, prefix, transposed, unfold,
+                                            lambda m: None)
+    out = load_file(str(dest / "model.safetensors"))
+    for key in ("model.layers.0.input_layernorm.weight",
+                "model.layers.3.self_attn.q_norm.weight",
+                "model.layers.3.self_attn.k_norm.weight",
+                "model.norm.weight"):
+        expect = (folded["language_model." + key].float() - 1.0).to(torch.bfloat16)
+        assert torch.equal(out[key], expect), key
+        assert out[key].dtype == torch.bfloat16, "存储精度必须保持"
+    # RMSNormGated 的权重一个值都不能动
+    assert torch.equal(out["model.layers.0.linear_attn.norm.weight"],
+                       folded["language_model.model.layers.0.linear_attn.norm.weight"])
 
 
 def test_coreml_cast_noise_filter_drops_precision_warning():

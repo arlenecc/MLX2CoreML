@@ -132,7 +132,7 @@ int32），大模型可达数万条、把日志刷满。这些常量都是远小
 
 ### 3.1 权重布局归一化（加载前的强制校验）
 
-MLX 生态的 checkpoint 未必是 transformers 能直接加载的布局，两类差异必须修正：
+MLX 生态的 checkpoint 未必是 transformers 能直接加载的布局，三类差异必须修正：
 
 1. **多模态（复合）前缀**：MLX 的多模态布局把文本模型放在 `language_model.` 之下
    （并带有 `vision_tower.*`），而 `AutoModelForCausalLM` 期望 `model.layers.*`；
@@ -140,6 +140,14 @@ MLX 生态的 checkpoint 未必是 transformers 能直接加载的布局，两�
    `(out, in, kernel)`。GDN / linear attention 的 conv1d 权重因此要么形状对不上而
    直接报错，要么在两维恰好相等时被**静默当成正确权重**加载。mlx-lm 的
    `convert`（含量化模型的反量化）不做这一步转换。
+3. **RMSNorm 权重折叠**（Qwen3.5 系）：HF 的 `Qwen3_5RMSNorm` 是零中心约定
+   `1.0 + weight`，mlx-lm 的 `sanitize` 在 convert 时给 norm 权重预加 1.0 折叠。
+   mlx-lm 再次加载该产物时不重复加（以 conv1d 已是 MLX 布局为信号），但直接喂给
+   HF 就是**双重 +1**（`2+gain`），归一化尺度翻倍——不报错、shape 全对，输出全是
+   乱码。修正：写回 HF 布局时对 `input_layernorm` / `post_attention_layernorm` /
+   `model.norm` / `q_norm` / `k_norm` 减 1.0；GDN 内部的 `linear_attn.norm` 是
+   `RMSNormGated`（HF 侧本就不加 +1），必须原样保留。判定信号与 mlx-lm 互为镜像：
+   conv1d 需要转置 ⟺ convert 时已消毒 ⟺ norm 权重是 `1+gain`。
 
 关键在于：**名字对不上时 transformers 不会报错**，它把所有权重"新建初始化"，
 于是转换"成功"、产出的却是一个随机权重的模型。因此加载前必须先校验：
@@ -150,7 +158,8 @@ MLX 生态的 checkpoint 未必是 transformers 能直接加载的布局，两�
 - `_resolve_weight_layout`：选出匹配的前缀，并按"期望形状 = checkpoint 形状交换
   后两维"判定需要转置的张量；重合比例低于阈值时返回 `None` → **中止转换并报错**；
 - 需要归一化时 `_write_text_checkpoint` 逐分片另存（内存约等于一个分片），
-  只保留文本权重，`vision_tower.*` 一并丢弃。
+  只保留文本权重，`vision_tower.*` 一并丢弃；Qwen3.5 系另还原 RMSNorm 的
+  `1+gain` 折叠（`_needs_norm_unfolding` 判定）。
 
 布局已经匹配时这一整套检查为零成本（不读权重数据、不落盘），只有真的不匹配才
 产生一份临时副本。
