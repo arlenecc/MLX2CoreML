@@ -171,9 +171,10 @@ final class ChatController: ObservableObject {
         DispatchQueue.main.async { self.status = "加载中（首次 ANE 特化可能需 1–2 分钟）…" }
         DispatchQueue.global(qos: .userInitiated).async {
             self.clearPreviousCompiledCache()   // 切换/重载前先删掉上一模型的编译缓存
-            do {
-                let url = URL(fileURLWithPath: path)
-                let (m, compiled) = try loadConvertedModel(url, computeUnits: cu)
+            let fileURL = URL(fileURLWithPath: path)
+            // 加载 + 零初始化 GDN 状态 + 首次预热，封装成闭包以便失败后重试。
+            let attempt: (MLComputeUnits) throws -> (MLModel, URL?, [String: MLMultiArray], Int, String) = { unit in
+                let (m, compiled) = try loadConvertedModel(fileURL, computeUnits: unit)
                 var gs: [String: MLMultiArray] = [:]
                 for (n, d) in m.modelDescription.inputDescriptionsByName {
                     if n.hasSuffix("_states"), let shape = d.multiArrayConstraint?.shape {
@@ -189,19 +190,46 @@ final class ChatController: ObservableObject {
                 }
                 // 预热：用一次性 state 触发 ANE 程序特化，不污染正式对话的 KV cache
                 let _ = try forwardWithConvertedModel(m, m.makeState(), token: 0, position: 0, gdnStates: gs)
+                return (m, compiled, gs, vocab, self.computeUnitLabel(unit))
+            }
+            var m: MLModel?; var compiled: URL?; var gs: [String: MLMultiArray] = [:]
+            var vocab = 0; var devLabel = ""
+            do {
+                do {
+                    (m, compiled, gs, vocab, devLabel) = try attempt(cu)
+                } catch {
+                    // 选「自动(.all)」时若 ANE 构建执行计划失败（-14，常见于大上下文模型），
+                    // 自动退到「仅 GPU+CPU」再试一次；显式选了其他设备则不回退。
+                    if cu == .all {
+                        (m, compiled, gs, vocab, devLabel) = try attempt(.cpuAndGPU)
+                        devLabel += "（ANE 计划失败，已自动回退仅GPU+CPU）"
+                    } else {
+                        throw error
+                    }
+                }
+                let model = m!, c = compiled, g = gs, v = vocab, d = devLabel
                 DispatchQueue.main.async {
-                    self.model = m
-                    self.state = m.makeState()   // 干净的 KV
-                    self.gdnStates = gs
-                    self.vocab = vocab
+                    self.model = model
+                    self.state = model.makeState()   // 干净的 KV
+                    self.gdnStates = g
+                    self.vocab = v
                     self.pos = 0
-                    self.compiledURL = compiled   // 记录编译缓存路径，便于退出时清理
+                    self.compiledURL = c   // 记录编译缓存路径，便于退出时清理
                     self.loaded = true
-                    self.loadedName = url.lastPathComponent
-                    self.status = "已加载：\(url.lastPathComponent)｜vocab=\(vocab)｜device=\(self.computeUnitLabel(cu))"
+                    self.loadedName = fileURL.lastPathComponent
+                    self.status = "已加载：\(fileURL.lastPathComponent)｜vocab=\(v)｜device=\(d)"
                 }
             } catch {
-                DispatchQueue.main.async { self.status = "加载失败：\(error)"; self.loaded = false }
+                // 把完整错误同时打到可滚动对话区与日志文件，便于定位（尤其是 ANE -14）。
+                let detail = "\(error)"
+                let msg = "加载失败：\(detail)"
+                try? detail.write(toFile: "/tmp/modconv_gui_load_error.log",
+                                 atomically: true, encoding: .utf8)
+                DispatchQueue.main.async {
+                    self.status = msg
+                    self.loaded = false
+                    self.append(msg + "\n（完整错误已写入 /tmp/modconv_gui_load_error.log）\n")
+                }
             }
         }
     }
