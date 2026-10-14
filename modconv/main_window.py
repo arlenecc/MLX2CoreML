@@ -17,6 +17,7 @@ from PyQt6.QtCore import QEventLoop, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -125,17 +126,21 @@ class MainWindow(QMainWindow):
             "输入超过模型位置编码上限时会被自动截断。")
         grid.addWidget(self.max_seq_edit, 2, 1)
 
-        # 4-bit 权重压缩：体积约为未量化的 1/4～1/8，但部分架构（如 Qwen3.5 的
-        # GDN 混合注意力）量化后的图在 ANE 上构建不了执行计划——工具会自动退回
-        # 未量化重转（要多花一倍以上时间），这里允许直接关掉以省时。
-        self.quantize_check = QCheckBox("权重 4-bit 压缩（减小体积；关闭则输出 fp16 全精度）")
-        self.quantize_check.setChecked(True)
-        self.quantize_check.setToolTip(
-            "对输出权重做 4-bit palettization，模型体积约为未压缩的 1/4～1/8。\n"
-            "少数架构量化后无法在 ANE 上运行，工具会自动改为未量化重转；\n"
-            "若已知目标架构不支持（或想省去这次重转），可取消勾选。")
-        self.quantize_check.toggled.connect(lambda _: self._refresh_estimate())
-        grid.addWidget(self.quantize_check, 3, 0, 1, 2)
+        # 权重压缩：n-bit palettization 减小体积、加速端侧推理。
+        # 4-bit 体积最小（≈fp16 的 1/4～1/8），8-bit 精度最稳但体积大；
+        # fp16 为不压缩全精度。下拉顺序与 _QUANT_ITEMS 索引绑定。
+        self.quant_combo = QComboBox()
+        self._QUANT_ITEMS = [("fp16（不压缩）", None),
+                             ("4-bit", 4), ("6-bit", 6), ("8-bit", 8)]
+        self.quant_combo.addItems([label for label, _ in self._QUANT_ITEMS])
+        self.quant_combo.setCurrentIndex(1)  # 默认 4-bit
+        self.quant_combo.setToolTip(
+            "对输出权重做 n-bit palettization，减小体积、加速端侧推理。\n"
+            "4-bit 体积最小（≈fp16 的 1/4～1/8），8-bit 精度最稳但体积大；\n"
+            "少数架构量化后无法在 ANE 上运行，工具会自动改为未量化重转。")
+        self.quant_combo.currentIndexChanged.connect(lambda _: self._refresh_estimate())
+        grid.addWidget(QLabel("权重压缩:"), 3, 0)
+        grid.addWidget(self.quant_combo, 3, 1)
 
         # 手动输入路径后延迟触发扫描：连续敲键盘/多次回车会各起一次全目录扫描
         # （旧扫描无法取消，还会互相抢占），防抖后只保留最后一次
@@ -283,6 +288,11 @@ class MainWindow(QMainWindow):
         self._pending_start = False
         self.source_stats_label.setText(f"扫描失败: {message}")
 
+    def _selected_quantize_nbits(self) -> "int | None":
+        """从压缩下拉框解析要传给后端的权重 bit 数；fp16 项返回 None（不压缩）。"""
+        _, nbits = self._QUANT_ITEMS[self.quant_combo.currentIndex()]
+        return nbits
+
     def _refresh_estimate(self):
         """按当前扫描结果 + 架构预判 + 压缩开关刷新体积预估。"""
         scan = self._scan_result
@@ -293,10 +303,11 @@ class MainWindow(QMainWindow):
         model_type = detect_model_type(scan.source)
         backend = ("coremltools" if model_type in SUPPORTED_MODEL_TYPES
                    else "package")
+        nbits = self._selected_quantize_nbits()
         estimate = estimate_output(scan, backend=backend,
-                                   compressed=self.quantize_check.isChecked())
+                                   compressed=(nbits is not None))
         note = ("（打包口径）" if backend == "package"
-                else "（4-bit 压缩估算）" if self.quantize_check.isChecked()
+                else f"（{nbits}-bit 压缩估算）" if nbits
                 else "（fp16 未压缩估算）")
         self.estimate_stats_label.setText(
             f"预计 Core ML 输出: ≈{estimate.file_count} 个文件, "
@@ -429,8 +440,7 @@ class MainWindow(QMainWindow):
         self._log(f"开始转换: {source.name} → {output}")
         worker = ConversionWorker(source, output, self._scan_result.files,
                                   max_seq_len=max_seq_len,
-                                  quantize_nbits=(4 if self.quantize_check.isChecked()
-                                                  else None))
+                                  quantize_nbits=self._selected_quantize_nbits())
         self._conv_worker = worker
         self._conv_workers.append(worker)
         worker.log_message.connect(self._log)
@@ -501,7 +511,7 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool):
         for widget in (self.source_edit, self.output_edit, self.max_seq_edit,
-                       self.quantize_check, self.source_browse_btn,
+                       self.quant_combo, self.source_browse_btn,
                        self.output_browse_btn, self.start_button):
             widget.setEnabled(not running)
         self.cancel_button.setEnabled(running)

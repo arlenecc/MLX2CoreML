@@ -11,7 +11,10 @@ dependencies = ["PyQt6>=6.6"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-qt>=4.4"]
-convert = ["torch>=2.2", "transformers>=4.44", "coremltools>=8.0", "safetensors>=0.4", "numpy",
+# torch 上限锁在 2.7.x：coremltools 9.0 仅与 torch 2.7.0 做过适配。
+# 3.13 重装依赖时若无上限会被拉到 2.14.x，其 torch.export 的
+# run_decompositions(AOT 阶段) 会崩溃，导致转换全流程失败。
+convert = ["torch>=2.2,<2.8", "torchvision>=0.17,<0.23", "transformers>=4.44", "coremltools>=8.0", "safetensors>=0.4", "numpy",
            # MLX 量化模型反量化需要（仅 macOS）
            "mlx-lm>=0.25; platform_system=='Darwin'"]
 

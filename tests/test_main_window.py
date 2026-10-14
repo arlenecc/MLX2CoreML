@@ -170,12 +170,12 @@ def test_start_passes_max_seq_len_to_worker(qtbot, window, model_dir, tmp_path, 
 
 
 # --------------------------------------------------------------------- #
-# 4-bit 权重压缩开关
+# 权重压缩下拉（fp16 / 4-bit / 6-bit / 8-bit）
 # --------------------------------------------------------------------- #
 
-def test_quantize_toggle_defaults_on_and_passes_to_worker(qtbot, window, model_dir,
-                                                          tmp_path, monkeypatch):
-    """默认做 4-bit 压缩；取消勾选后应向 worker 传 None（关闭量化）。"""
+def test_quantize_defaults_to_4bit_and_passes_to_worker(qtbot, window, model_dir,
+                                                         tmp_path, monkeypatch):
+    """默认做 4-bit 压缩；切到 fp16 / 6-bit / 8-bit 时向 worker 传对应 bit 数。"""
     from unittest.mock import MagicMock
 
     captured = []
@@ -187,7 +187,7 @@ def test_quantize_toggle_defaults_on_and_passes_to_worker(qtbot, window, model_d
     monkeypatch.setattr("modconv.main_window.ConversionWorker", _spy_cls)
     _prepare_scan(qtbot, window, model_dir)
     window.output_edit.setText(str(tmp_path / "out"))
-    assert window.quantize_check.isChecked()
+    assert window.quant_combo.currentIndex() == 1  # 默认 4-bit
 
     def _click_and_reset():
         window.start_button.click()
@@ -200,20 +200,29 @@ def test_quantize_toggle_defaults_on_and_passes_to_worker(qtbot, window, model_d
     _click_and_reset()
     assert captured[-1].get("quantize_nbits") == 4
 
-    window.quantize_check.setChecked(False)
+    # fp16（不压缩）
+    window.quant_combo.setCurrentIndex(0)
     _click_and_reset()
     assert captured[-1].get("quantize_nbits") is None
 
+    # 6-bit / 8-bit
+    window.quant_combo.setCurrentIndex(2)
+    _click_and_reset()
+    assert captured[-1].get("quantize_nbits") == 6
+    window.quant_combo.setCurrentIndex(3)
+    _click_and_reset()
+    assert captured[-1].get("quantize_nbits") == 8
+
 
 def test_quantize_toggle_updates_estimate(qtbot, window, hf_model_dir, tmp_path):
-    """关掉压缩后体积预估应切换为 fp16 口径（显著大于 4-bit 估算）。"""
+    """切到 fp16 后体积预估应切换为未压缩口径（显著大于 4-bit 估算）。"""
     import re
 
     _prepare_scan(qtbot, window, hf_model_dir)
     window.output_edit.setText(str(tmp_path / "out"))
     before = window.estimate_stats_label.text()
     assert "4-bit 压缩估算" in before
-    window.quantize_check.setChecked(False)
+    window.quant_combo.setCurrentIndex(0)  # fp16（不压缩）
     after = window.estimate_stats_label.text()
     assert "fp16 未压缩估算" in after
 
@@ -225,12 +234,12 @@ def test_quantize_toggle_updates_estimate(qtbot, window, hf_model_dir, tmp_path)
     assert _bytes(after) > _bytes(before) * 2
 
 
-def test_running_disables_quantize_check(window):
-    """转换运行中压缩开关应与其它配置一致被禁用。"""
+def test_running_disables_quant_combo(window):
+    """转换运行中压缩下拉应与其它配置一致被禁用。"""
     window._set_running(True)
-    assert not window.quantize_check.isEnabled()
+    assert not window.quant_combo.isEnabled()
     window._set_running(False)
-    assert window.quantize_check.isEnabled()
+    assert window.quant_combo.isEnabled()
 
 
 # --------------------------------------------------------------------- #
