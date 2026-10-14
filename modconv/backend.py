@@ -28,6 +28,26 @@ def _mlx_available() -> bool:
         return False
 
 
+# 真实转换依赖（仅做 find_spec 轻量探测，不真正导入 torch 等重型库）。
+# 缓存结果，供 UI 体积预估 / 架构提示复用：避免每次扫描结束都触发一次重型导入
+# （import torch 会卡住界面），同时让"预估口径"与 probe_backend 实际选定的后端一致，
+# 否则依赖缺失时界面显示"4-bit 压缩估算"、实际却走 1:1 打包后端，造成误导。
+_REAL_BACKEND_DEPS = ("torch", "transformers", "coremltools", "numpy", "safetensors")
+_real_backend_ready: Optional[bool] = None
+
+
+def real_backend_available() -> bool:
+    """真实转换依赖是否齐备（find_spec 轻量探测，结果缓存）。"""
+    global _real_backend_ready
+    if _real_backend_ready is None:
+        try:
+            _real_backend_ready = all(
+                importlib.util.find_spec(m) is not None for m in _REAL_BACKEND_DEPS)
+        except Exception:
+            _real_backend_ready = False
+    return _real_backend_ready
+
+
 @dataclass(frozen=True)
 class BackendPlan:
     name: str  # "coremltools" | "package"

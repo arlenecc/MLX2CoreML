@@ -14,16 +14,9 @@ import Dispatch
 import Foundation
 import Combine
 
-// 转换产物路径：按需改成你自己的 .mlpackage。也可用环境变量 MODCONV_MODEL_<key> 覆盖。
-let MODEL_PATHS: [String: String] = [
-    "Qwen3.5-0.8B (4bit, 8k)":  ProcessInfo.processInfo.environment["MODCONV_MODEL_4BIT8K"]
-        ?? "/Users/arlenecc/Core-ML/0.8-4bit-8k/Qwen3.5-0.8B-bf16.mlpackage",
-    "Qwen3.5-0.8B (6bit, 4k)":  ProcessInfo.processInfo.environment["MODCONV_MODEL_6BIT4K"]
-        ?? "/Users/arlenecc/Core-ML/0.8-6bit-4k/Qwen3.5-0.8B-6bit.mlpackage",
-    "Qwen3.5-0.8B (int4, 512)": ProcessInfo.processInfo.environment["MODCONV_MODEL_INT4"]
-        ?? "/Users/arlenecc/Core-ML/0.8-4bit-512/Qwen3.5-0.8B-int4.mlpackage",
-]
-let MODEL_ORDER = Array(MODEL_PATHS.keys)
+// 模型改为运行时选取：点「选择模型」弹出文件夹选择框，选中 .mlpackage（或已编译的
+// .mlmodelc）后点「加载模型」即载入。不再内置固定路径下拉。
+
 
 // 分词脚本与 Python：优先用本 App 包内的 tok_helper.py，其次回退到脚本同目录/默认路径。
 let PYTHON: String = {
@@ -118,8 +111,8 @@ struct ChatResult {
 final class ChatController: ObservableObject {
     @Published var status = "未加载"
     @Published var loaded = false
-    @Published var modelName = MODEL_ORDER[0]
-    @Published var loadedName = ""
+    @Published var modelName = ""   // 当前选中（待加载）模型名（取自文件夹名）
+    @Published var loadedName = ""  // 已加载模型名
     @Published var transcript = "对话将在模型加载后开始。\n在下方输入内容并点「发送」即可体验多轮对话。\n"
     @Published var running = false
 
@@ -128,11 +121,28 @@ final class ChatController: ObservableObject {
     private var gdnStates: [String: MLMultiArray] = [:]
     private var vocab: Int = 0
     private var compiledURL: URL?   // 最近一次 compileModel 生成的 .mlmodelc，退出时清理
+    private var selectedURL: URL?   // 用户通过文件夹选择框选中的模型路径
     private var pos: Int32 = 0   // 当前序列长度（跨轮持续累加，KV cache 不重置）
 
-    func load(named: String) {
-        modelName = named
-        let path = MODEL_PATHS[named] ?? ""
+    /// 用户在文件夹选择框选中模型后调用：仅记录路径并更新显示，不立即加载。
+    func select(url: URL) {
+        selectedURL = url
+        modelName = url.lastPathComponent
+        status = "已选择：\(url.lastPathComponent)｜点「加载模型」载入"
+    }
+
+    /// 点「加载模型」时调用：加载当前选中的模型文件夹。
+    func loadSelected() {
+        guard let url = selectedURL else {
+            status = "请先点「选择模型」选取 .mlpackage 模型文件"
+            return
+        }
+        load(url: url)
+    }
+
+    func load(url: URL) {
+        modelName = url.lastPathComponent
+        let path = url.path
         guard !path.isEmpty else { return }
         DispatchQueue.main.async { self.status = "加载中（首次 ANE 特化可能需 1–2 分钟）…" }
         DispatchQueue.global(qos: .userInitiated).async {
@@ -163,8 +173,8 @@ final class ChatController: ObservableObject {
                     self.pos = 0
                     self.compiledURL = compiled   // 记录编译缓存路径，便于退出时清理
                     self.loaded = true
-                    self.loadedName = named
-                    self.status = "已加载：\(named)｜vocab=\(vocab)"
+                    self.loadedName = url.lastPathComponent
+                    self.status = "已加载：\(url.lastPathComponent)｜vocab=\(vocab)"
                 }
             } catch {
                 DispatchQueue.main.async { self.status = "加载失败：\(error)"; self.loaded = false }
@@ -343,7 +353,9 @@ final class ChatController: ObservableObject {
 // MARK: - Cocoa UI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
-    private var modelPopUp: NSPopUpButton!
+    private var selectButton: NSButton!
+    private var loadButton: NSButton!
+    private var selectedPathLabel: NSTextField!
     private var statusLabel: NSTextField!
     private var promptField: NSTextField!
     private var maxNewStepper: NSStepper!
@@ -369,13 +381,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = root
 
         let row1 = NSStackView(); row1.orientation = .horizontal; row1.spacing = 8
-        modelPopUp = NSPopUpButton()
-        for k in MODEL_ORDER { modelPopUp.addItem(withTitle: k) }
-        modelPopUp.target = self; modelPopUp.action = #selector(modelChanged(_:))
-        let loadBtn = NSButton(title: "加载模型", target: self, action: #selector(loadTapped(_:)))
+        selectButton = NSButton(title: "选择模型", target: self, action: #selector(selectTapped(_:)))
+        selectedPathLabel = NSTextField(labelWithString: "（未选择模型文件）")
+        selectedPathLabel.font = NSFont.systemFont(ofSize: 11)
+        selectedPathLabel.textColor = .secondaryLabelColor
+        selectedPathLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        loadButton = NSButton(title: "加载模型", target: self, action: #selector(loadTapped(_:)))
         resetButton = NSButton(title: "清空对话", target: self, action: #selector(resetTapped(_:)))
-        row1.addArrangedSubview(modelPopUp)
-        row1.addArrangedSubview(loadBtn)
+        row1.addArrangedSubview(selectButton)
+        row1.addArrangedSubview(selectedPathLabel)
+        row1.addArrangedSubview(loadButton)
         row1.addArrangedSubview(resetButton)
 
         let row2 = NSStackView(); row2.orientation = .horizontal; row2.spacing = 8
@@ -426,7 +441,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         installSignalCleanup()   // 捕获 SIGTERM（pkill/注销），退出前清理 CoreML 缓存
-        controller.load(named: controller.modelName)
     }
 
     /// 监听 SIGTERM（pkill / 系统注销 / kill 默认信号）：触发后清理编译缓存再退出，
@@ -455,25 +469,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.$transcript.receive(on: RunLoop.main)
             .sink { [weak self] t in self?.transcriptView.string = t
                     self?.transcriptView.scrollToEndOfDocument(nil) }.store(in: &cancellables)
+        controller.$modelName.receive(on: RunLoop.main).sink { [weak self] n in
+            self?.selectedPathLabel.stringValue = n.isEmpty ? "（未选择模型文件）" : "已选: \(n)"
+        }.store(in: &cancellables)
         controller.$loaded.receive(on: RunLoop.main).sink { [weak self] _ in self?.updateUI() }.store(in: &cancellables)
         controller.$running.receive(on: RunLoop.main).sink { [weak self] _ in self?.updateUI() }.store(in: &cancellables)
         controller.$modelName.receive(on: RunLoop.main).sink { [weak self] _ in self?.updateUI() }.store(in: &cancellables)
     }
 
     private func updateUI() {
+        let hasSelection = !controller.modelName.isEmpty
         let ok = controller.loaded && controller.modelName == controller.loadedName && !controller.running
+        loadButton.isEnabled = hasSelection && !controller.running
         sendButton.isEnabled = ok
         resetButton.isEnabled = controller.loaded && !controller.running
         sendButton.title = controller.running ? "生成中…" : "发送"
     }
 
-    @objc private func modelChanged(_ sender: Any) {
-        controller.modelName = MODEL_ORDER[modelPopUp.indexOfSelectedItem]
+    /// 弹出文件选择框：选中转换产物 .mlpackage（或已编译 .mlmodelc）文件。
+    @objc private func selectTapped(_ sender: Any) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false  // 选文件，不选目录（目录无法直接加载）
+        panel.canChooseFiles = true          // .mlpackage 在 Finder 中作为包（文件）呈现，直接选该文件
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.message = "选择 modconv 转换产物：.mlpackage 或 .mlmodelc 文件"
+        panel.beginSheetModal(for: self.window) { [weak self] resp in
+            guard resp == .OK, let url = panel.url else { return }
+            self?.controller.select(url: url)
+        }
     }
     @objc private func loadTapped(_ sender: Any) {
-        let key = MODEL_ORDER[modelPopUp.indexOfSelectedItem]
-        controller.modelName = key
-        controller.load(named: key)
+        controller.loadSelected()
     }
     @objc private func resetTapped(_ sender: Any) {
         controller.resetConversation()

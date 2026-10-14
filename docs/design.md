@@ -1,6 +1,6 @@
 # MLX2CoreML 软件设计文档
 
-版本：0.1.0 ｜ 更新日期：2026-10-11
+版本：0.1.0 ｜ 更新日期：2026-10-14
 
 把 MLX/HF 格式大语言模型转换为带 KV cache 状态的 Core ML `.mlpackage`（PyQt6 GUI）。
 Python 包与命令行名为 `modconv`，macOS 应用与仓库名为 **MLX2CoreML**。
@@ -308,13 +308,17 @@ MLX 生态的 checkpoint 未必是 transformers 能直接加载的布局，三�
   gemma / gemma2 / phi3；
 - `SEQ_LEN_CAP = 512`：自动选取的上限（KV buffer 体积随长度线性增长，
   fp32 buffer 转 fp16 state 后约 `2 × layers × n_kv_heads × L × head_dim × 2B`）；
-  用户可显式输入更大值（仍受模型位置编码上限截断）；
+  用户可显式输入更大值（仍受模型位置编码上限截断），但 GUI 默认即「自动（≤512）」——
+  显式大长度会生成 GB 级 KV cache 且在 ANE 上大概率 `-14`，触发自动逐级降长度重试
+  （每次重做 ANE 编译，耗时极长），故默认不鼓励；
 - 非量化模型以 fp32 加载（转换目标 fp16，保证单次舍入）；
 - 打包后端输出为权重 1:1 拷贝（含 Manifest），不能直接用 Core ML 推理，
   仅作为依赖缺失时的兜底产物；
-- 输出体积预估（GUI "预计 Core ML 输出"）按后端口径分别估算：架构受支持时按
-  fp16 + 4-bit 折算（未计入 LUT / Manifest 等固定开销，系统性偏低），否则按打包
-  1:1，仅供粗略参考；
+- 输出体积预估（GUI "预计 Core ML 输出"）按后端口径分别估算：架构受支持**且**
+  真实转换依赖（torch/transformers/coremltools）齐备时按真实转换口径，否则按打包
+  1:1。真实转换口径只计入权重，按 fp16 再按所选压缩位数折算（4/6/8-bit 各用对应
+  系数，未指定位数时回退 0.35），未计入 LUT / Manifest 等固定开销，系统性偏低，
+  仅供粗略参考；
 - 多模态（VL）checkpoint 只转换其**文本 LM**部分：`vision_tower.*` 权重被丢弃，
   产出的是纯文本模型；
 - 权重布局不匹配时（见 §3.1）需要额外写出一份与源权重等大的临时副本，

@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from modconv.backend import SUPPORTED_MODEL_TYPES, detect_model_type
+from modconv.backend import SUPPORTED_MODEL_TYPES, detect_model_type, real_backend_available
 from modconv.estimator import estimate_output
 from modconv.scanner import ScanResult
 from modconv.utils import format_size
@@ -128,7 +128,11 @@ class MainWindow(QMainWindow):
             ("128k", 131072), ("256k", 262144),
         ]
         self.max_seq_combo.addItems([label for label, _ in self._MAX_SEQ_PRESETS])
-        self.max_seq_combo.setCurrentIndex(3)  # 默认 8k
+        # 默认「自动（≤512）」：SEQ_LEN_CAP=512 是 ANE 能稳定构建执行计划的
+        # 上限，显式选更大值（8k/16k…）会生成 GB 级 KV buffer，且在 ANE 上大概率
+        # -14，从而触发一连串自动降级重试（每次都重做 ANE 编译，耗时极长）。未
+        # 指定时由后端按 min(位置编码上限, 512) 选取，是最稳妥的默认。
+        self.max_seq_combo.setCurrentIndex(0)  # 默认「自动（≤512）」
         self.max_seq_combo.setToolTip(
             "转换输出的最大上下文长度（token 数）。\n"
             "可选预设档位，也可直接输入自定义整数（如 4096）或带 k 后缀（如 8k）；\n"
@@ -307,14 +311,15 @@ class MainWindow(QMainWindow):
         scan = self._scan_result
         if scan is None:
             return
-        # 体积预估按架构预判的后端口径计算：支持的架构走真实转换，否则按打包 1:1。
-        # 这里只做 config.json 的轻量读取，不导入 torch/coremltools 以免卡顿。
+        # 体积预估按实际后端口径计算：架构受支持「且」真实转换依赖齐备时走真实
+        # 转换，否则按打包 1:1。两者都只做轻量读取（config.json / find_spec），
+        # 不真正导入 torch/coremltools，避免界面卡顿。
         model_type = detect_model_type(scan.source)
-        backend = ("coremltools" if model_type in SUPPORTED_MODEL_TYPES
-                   else "package")
+        real_ok = model_type in SUPPORTED_MODEL_TYPES and real_backend_available()
+        backend = "coremltools" if real_ok else "package"
         nbits = self._selected_quantize_nbits()
         estimate = estimate_output(scan, backend=backend,
-                                   compressed=(nbits is not None))
+                                   compressed=(nbits is not None), nbits=nbits)
         note = ("（打包口径）" if backend == "package"
                 else f"（{nbits}-bit 压缩估算）" if nbits
                 else "（fp16 未压缩估算）")
@@ -330,13 +335,19 @@ class MainWindow(QMainWindow):
         self.source_stats_label.setText(
             f"MLX 模型目录: {result.count} 个文件, {format_size(result.total_bytes)}")
         self._refresh_estimate()
-        # 不支持/无法识别的架构会在转换时才暴露（转换失败或退回打包产物），
-        # 扫描阶段就提示，避免用户等半天才发现走了兜底路径
+        # 不支持/无法识别的架构、或真实转换依赖缺失，都会在转换时才暴露
+        # （转换失败，或静默退回打包产物），扫描阶段就提示，避免用户等半天才
+        # 发现走了兜底路径
         model_type = detect_model_type(result.source)
         if model_type not in SUPPORTED_MODEL_TYPES:
             arch = model_type or "未识别（缺少或非法的 config.json）"
             hint = (f"架构 '{arch}' 暂不支持真实转换，将使用打包后端"
                     if model_type else f"{arch}，将使用打包后端")
+            self._log(hint)
+            self._set_status(hint)
+        elif not real_backend_available():
+            hint = ("真实转换依赖（torch / transformers / coremltools）缺失，"
+                    "将使用打包后端（产物不可直接推理）")
             self._log(hint)
             self._set_status(hint)
         self.scan_completed.emit(result)

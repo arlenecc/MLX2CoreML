@@ -121,12 +121,18 @@ def test_pending_start_revalidates_output(qtbot, window, model_dir):
 # --------------------------------------------------------------------- #
 
 def test_max_seq_len_input_defaults_and_parsing(qtbot, window):
-    """默认 8k；预设档位与自定义整数（含 k 后缀）生效；非法输入弹窗并返回 -1。"""
+    """默认「自动（≤512）」；预设档位与自定义整数（含 k 后缀）生效；非法输入弹窗并返回 -1。
+
+    默认选自动而非 8k：显式大长度会生成 GB 级 KV cache 且在 ANE 上大概率 -14，
+    从而触发一长串自动降级重试（每次重做 ANE 编译，耗时极长），自动（≤512）最稳妥。
+    """
     assert window.max_seq_combo is not None
-    assert window.max_seq_combo.currentText() == "8k"
-    assert window._max_seq_len_from_input() == 8192
+    assert window.max_seq_combo.currentText() == "自动（≤512）"
+    assert window._max_seq_len_from_input() is None  # 自动
 
     # 预设档位
+    window.max_seq_combo.setCurrentText("8k")
+    assert window._max_seq_len_from_input() == 8192
     window.max_seq_combo.setCurrentText("32k")
     assert window._max_seq_len_from_input() == 32768
     window.max_seq_combo.setCurrentText("自动（≤512）")

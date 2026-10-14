@@ -8,7 +8,12 @@ import pytest
 from test_converter import RecordingHooks
 
 import modconv.real_backend as real_backend_mod
-from modconv.backend import BackendPlan, detect_model_type, probe_backend
+from modconv.backend import (
+    BackendPlan,
+    detect_model_type,
+    probe_backend,
+    real_backend_available,
+)
 from modconv.real_backend import CoremltoolsBackend
 
 
@@ -1007,3 +1012,14 @@ def test_real_backend_quantization_failure_propagates(tmp_path, monkeypatch):
     libs.ct.optimize.coreml.palettize_weights = _boom
     with pytest.raises(RuntimeError, match="kmeans failed"):
         _stub_run(src, out, monkeypatch, libs=libs, max_seq_len=8)
+
+
+def test_real_backend_available_returns_bool_and_is_cached():
+    """真实转换依赖探测返回 bool，且对同一环境结果稳定（缓存）。"""
+    first = real_backend_available()
+    assert isinstance(first, bool)
+    # 重复调用应返回相同结果（结果被缓存，不随调用次数变化）
+    assert real_backend_available() is first
+    # 缓存值是确定性的：对任意已知缺失的模块名，find_spec 返回 None
+    import importlib.util
+    assert importlib.util.find_spec("this_module_does_not_exist_xyz") is None

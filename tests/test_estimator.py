@@ -47,6 +47,24 @@ def test_estimate_coremltools_backend_without_compression():
     assert est.total_bytes == 500_000
 
 
+def test_estimate_coremltools_backend_per_nbit_factor():
+    """不同压缩位数应使用各自的估算系数（4/6/8-bit 不再共用 0.35）。"""
+    files = [FileInfo("model.safetensors", 1_000_000, True)]
+    # 4-bit: 0.5 × 0.35 = 0.175；8-bit: 0.5 × 0.5 = 0.25
+    est4 = estimate_output(_scan(files), backend="coremltools", nbits=4)
+    est8 = estimate_output(_scan(files), backend="coremltools", nbits=8)
+    assert est4.total_bytes == int(1_000_000 * 0.5 * 0.35)
+    assert est8.total_bytes == int(1_000_000 * 0.5 * 0.5)
+    assert est8.total_bytes > est4.total_bytes
+
+
+def test_estimate_coremltools_backend_unknown_nbit_falls_back():
+    """未列出位数的压缩回退到通用 0.35 系数。"""
+    files = [FileInfo("model.safetensors", 1_000_000, True)]
+    est = estimate_output(_scan(files), backend="coremltools", compressed=True, nbits=3)
+    assert est.total_bytes == int(1_000_000 * 0.5 * 0.35)
+
+
 def test_estimate_default_is_package_mode():
     """默认（打包）口径保持 1:1，避免影响既有调用方。"""
     files = [FileInfo("model.safetensors", 1000, True),
