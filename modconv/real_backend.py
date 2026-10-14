@@ -61,10 +61,15 @@ _WEIGHT_MATCH_RATIO = 0.5
 _TEXT_WEIGHT_PREFIXES = ("", "language_model.", "model.language_model.")
 
 _SWIFT_EXAMPLE_TEMPLATE = '''// 由 modconv 自动生成 — 模型 "{model_name}" 的 Swift 调用示例
-// stateful 模型：KV cache 存于 Core ML State，prefill 与 decode 共用同一模型。
-// 输入: input_ids (Int32, [1, q])、cache_position (Int32, [q])，q ∈ 1..{max_seq_len}
-// 输出: {output_name} (Float, [1, q, vocab_size])
+// 单步 decode 模型：每次前向推进**一个** token，prefill 由循环调用完成
+// （recurrent prefill）。KV cache 存于 Core ML State；混合架构的 GDN 状态
+// （conv_states / recurrent_states）走普通张量，逐步传入、取回再传下一步。
+// 输入: input_ids (Int32, [1, 1])、cache_position (Int32, [1])，取值 0..{max_seq_len_minus_1}
+//       conv_states / recurrent_states（混合架构才有）
+// 输出: {output_name} (Float, [1, 1, vocab_size]) + 下一步要回传的状态
 // 注意: 需先用分词器（如 swift-transformers）把文本转成 token ids。
+// 注意: 首次 prediction 会做 ANE 程序特化（大模型可能数分钟），建议 App 启动时
+//       先用任意合法 token 做一次预热前向。
 import CoreML
 import Foundation
 
@@ -86,27 +91,38 @@ func loadConvertedModel(_ modelURL: URL) throws -> MLModel {{
     return try MLModel(contentsOf: url, configuration: configuration)
 }}
 
-/// 单次前向：给定 token 与起始位置，返回最后一位 token 的 logits（MLMultiArray，长度 vocab）。
-/// - prefill 时 tokens 为整段 prompt、startPos 为 0；
-/// - decode 时 tokens 为单个 token、startPos 为已生成长度。
-/// 注意: 首次 prediction 会按输入形状做 ANE 程序特化，大模型可能耗时较久；建议在
-/// App 启动时先做一次预热前向（任意合法 token、startPos=0），避免首字延迟。
-func forwardWithConvertedModel(_ model: MLModel, _ state: MLState,
-                               tokens: [Int32], startPos: Int32) throws -> MLMultiArray {{
-    let q = tokens.count
-    let positions = (0..<q).map {{ startPos + Int32($0) }}
-    let features = try MLDictionaryFeatureProvider(dictionary: [
+/// 单步前向：推进一个 token，返回该步的 logits 与下一步要回传的状态。
+/// - token: 本步的 token id；position: 它在序列中的位置（0..{max_seq_len_minus_1}）
+/// - gdnStates: 上一步输出的 conv/recurrent 状态（首次调用传零数组）
+/// - 返回 (logits, 新的 gdn 状态字典)；KV cache 由 MLState 自动携带
+func forwardWithConvertedModel(
+    _ model: MLModel, _ state: MLState,
+    token: Int32, position: Int32,
+    gdnStates: [String: MLMultiArray]
+) throws -> (logits: MLMultiArray, newStates: [String: MLMultiArray]) {{
+    var dict: [String: Any] = [
         "input_ids": MLFeatureValue(multiArray: MLMultiArray(
-            MLShapedArray<Int32>(scalars: tokens, shape: [1, q]))),
+            MLShapedArray<Int32>(scalars: [token], shape: [1, 1]))),
         "cache_position": MLFeatureValue(multiArray: MLMultiArray(
-            MLShapedArray<Int32>(scalars: positions, shape: [q]))),
-    ])
-    let output = try model.prediction(from: features, using: state)
+            MLShapedArray<Int32>(scalars: [position], shape: [1]))),
+    ]
+    for (name, value) in gdnStates {{ dict[name] = MLFeatureValue(multiArray: value) }}
+    let output = try model.prediction(
+        from: try MLDictionaryFeatureProvider(dictionary: dict), using: state)
     guard let logits = output.featureValue(for: "{output_name}")?.multiArrayValue,
           logits.count > 0 else {{
         throw ConvertedModelError.missingOutput("{output_name}")
     }}
-    return logits
+    // 收集同名的新状态（Core ML 输出名形如 new_conv_states / conv_states）
+    var newStates: [String: MLMultiArray] = [:]
+    for name in gdnStates.keys {{
+        if let v = output.featureValue(for: name)?.multiArrayValue {{
+            newStates[name] = v
+        }} else if let v = output.featureValue(for: "new_" + name)?.multiArrayValue {{
+            newStates[name] = v
+        }}
+    }}
+    return (logits, newStates)
 }}
 
 /// 取 logits 最后一行 argmax 的 token id。
@@ -144,21 +160,40 @@ func generateWithConvertedModel(modelURL: URL, promptTokens: [Int32],
     let model = try loadConvertedModel(modelURL)
     let state = model.makeState()
 
-    // 1) prefill：整段 prompt 一次前向，KV cache 写入 state
-    var position: Int32 = 0
-    var logits = try forwardWithConvertedModel(model, state, tokens: promptTokens,
-                                               startPos: position)
-    position += Int32(promptTokens.count)
+    // 零初始化的 GDN 状态（混合架构专用；纯注意力模型该字典为空）
+    let gdnStateShapes: [String: [Int]] = {gdn_state_swift_literal}
+    var gdnStates: [String: MLMultiArray] = [:]
+    for (name, shape) in gdnStateShapes {{
+        let arr = try MLMultiArray(shape: shape.map {{ NSNumber(value: $0) }},
+                                   dataType: .float32)
+        memset(arr.dataPointer, 0, arr.count * MemoryLayout<Float>.size)
+        gdnStates[name] = arr
+    }}
 
-    // 2) decode：逐 token 前向，每步 cache_position = [position]，
-    //    KV cache 由模型 state 自动携带，无需重算前缀
+    // 1) recurrent prefill：逐 token 推进整段 prompt（同一步骤也用于 decode）
+    var position: Int32 = 0
+    var logits: MLMultiArray? = nil
+    for token in promptTokens {{
+        let out = try forwardWithConvertedModel(model, state, token: token,
+                                                position: position,
+                                                gdnStates: gdnStates)
+        logits = out.logits
+        gdnStates = out.newStates
+        position += 1
+    }}
+
+    // 2) decode：继续逐 token 前向
     var generated: [Int32] = []
     for _ in 0..<maxNewTokens {{
-        let next = argmaxToken(logits)
+        guard let current = logits else {{ break }}
+        let next = argmaxToken(current)
         generated.append(next)
         if position >= {max_seq_len} {{ break }}
-        logits = try forwardWithConvertedModel(model, state, tokens: [next],
-                                               startPos: position)
+        let out = try forwardWithConvertedModel(model, state, token: next,
+                                                position: position,
+                                                gdnStates: gdnStates)
+        logits = out.logits
+        gdnStates = out.newStates
         position += 1
     }}
     return generated
@@ -621,40 +656,41 @@ def _fail_fast_dynamo(libs):
 
 
 def _trace_torch_model(libs, model, max_seq_len: int):
-    """包装为 KV cache 状态模块并 torch.export 导出，返回 (exported, wrapper)。
+    """包装为单步 decode 模块并 torch.export 导出，返回 (exported, wrapper)。
 
-    动态形状：input_ids 第 1 维与 cache_position 第 0 维共享同一 Dim
-    （语义上二者长度恒相等；掩码与注意力相加也要求 q 维一致）。
+    图每次只推进**一个** token（input_ids 形状恒为 (1, 1)），prefill 由调用方
+    循环调用完成。这样 GDN 的分块内核（63 步三角求解展开、fp16 下 cumsum 误差
+    随步数放大）完全不需要出现在图里，算子数下降两个数量级——是 ANE 执行计划
+    构建失败（-14）、预测期编译卡死与精度发散的共同根源。
+
+    混合架构的 conv/recurrent state 作为图的**输入/输出**（不进 MLState，见
+    KvCacheWrapper.gdn_state_specs），因此示例输入里要带上它们。
     """
     torch = libs.torch
     wrapper = _build_kv_wrapper(model, max_seq_len).eval()
-    # 示例长度取 min(max_seq_len, 4) 且必须 >=2：torch.export 会把尺寸为 1 的
-    # 维度特化为常量（0/1 specialization），导致动态维度约束违规。
-    example_len = min(max_seq_len, 4)
-    example = (torch.ones((1, example_len), dtype=torch.long),
-               torch.arange(example_len))
-    # max_seq_len == 1 时 Dim(min=1, max=1) 非法（"inconsistent min=1, max=1"），
-    # 此时序列长度恒为 1，直接导出静态形状即可
-    if max_seq_len > 1:
-        seq = torch.export.Dim("seq", min=1, max=max_seq_len)
-        dynamic_shapes = {"input_ids": {1: seq}, "cache_position": {0: seq}}
-    else:
-        dynamic_shapes = None
+    example = [torch.ones((1, 1), dtype=torch.long), torch.zeros((1,), dtype=torch.long)]
+    for _, shape, dtype_str in wrapper.gdn_state_specs():
+        example.append(torch.zeros(shape, dtype=getattr(torch, dtype_str)))
+    # 全静态形状（单步 decode），无需声明动态维度
     # 包在 no_grad 里导出：模型参数 requires_grad=True 时，KV buffer 的 in-place
     # scatter_ 变异会被 aot_export 拒绝（"graph input that requires gradients,
     # and received a mutation"）。桩 torch 没有 no_grad 时退化为空上下文。
     no_grad = getattr(torch, "no_grad", nullcontext)
     with no_grad(), _fail_fast_dynamo(libs):
-        exported = torch.export.export(wrapper, example,
-                                       dynamic_shapes=dynamic_shapes)
+        exported = torch.export.export(wrapper, tuple(example))
     return exported.run_decompositions(_decomposition_table(libs)), wrapper
 
 
-def _convert_to_coreml(libs, exported, state_specs, max_seq_len):
-    """转换为带 KV cache 状态的 stateful mlprogram（iOS18 目标）。
+def _convert_to_coreml(libs, exported, state_specs, max_seq_len, gdn_state_specs=()):
+    """转换为带 KV cache 状态的单步 stateful mlprogram（iOS18 目标）。
 
     Core ML State 后端仅支持 fp16；KV buffer 固定 fp32（前端对 read_state 无条件
     插入 fp32 cast，见 KvCacheWrapper），state 读写由前端自动双向 cast。
+
+    只保留**一个** StateType（KV 缓存）：Core ML 在 ANE/CPU 上对多 StateType
+    的图会出问题（参考 ref/CoreML-LLM 在同架构上的实测：CPU runtime 误编译
+    slice_update 输出 garbage，ANE 侧 predict 期报 Error 11）。混合架构的
+    GDN conv/recurrent state 因此走普通输入/输出张量。
 
     只依赖导出图与 state 元信息（而非 KvCacheWrapper），这样调用方在追踪结束后
     就能立刻释放 wrapper 及其持有的 HF 模型。
@@ -665,14 +701,13 @@ def _convert_to_coreml(libs, exported, state_specs, max_seq_len):
                                                       dtype=np_dtype[dtype_str]),
                            name=name)
               for name, shape, dtype_str in state_specs]
-    # max_seq_len == 1 时 RangeDim(default=1, upper_bound=1) 非法（上下界相同会
-    # 退化成符号维度，与 EXIR 的静态形状 (1,1) 不匹配），直接用静态形状
-    seq_dim = (1 if max_seq_len <= 1
-               else ct.RangeDim(default=1, upper_bound=max_seq_len))
+    # 单步 decode：序列长度恒为 1，输入形状全静态
     inputs = [
-        ct.TensorType(name="input_ids", shape=(1, seq_dim), dtype=np.int32),
-        ct.TensorType(name="cache_position", shape=(seq_dim,), dtype=np.int32),
+        ct.TensorType(name="input_ids", shape=(1, 1), dtype=np.int32),
+        ct.TensorType(name="cache_position", shape=(1,), dtype=np.int32),
     ]
+    inputs += [ct.TensorType(name=name, shape=shape, dtype=np_dtype[dtype_str])
+               for name, shape, dtype_str in gdn_state_specs]
     return ct.convert(
         exported,
         inputs=inputs,
@@ -743,12 +778,21 @@ def _compress_weights(libs, mlmodel, nbits: int, log):
 
 
 def _write_swift_example(out_path: Path, model_name: str, max_seq_len: int,
-                         output_name: str) -> Path:
+                         output_name: str,
+                         gdn_state_specs: list[tuple[str, tuple[int, ...], str]] = ()
+                         ) -> Path:
     """在输出目录生成 Swift 调用示例文件。"""
+    # 混合架构的 GDN 状态形状写成 Swift 字面量，供示例里构造零初始数组
+    literal = ("[" + ", ".join(
+        f'"{name}": {list(shape)}' for name, shape, _ in gdn_state_specs) + "]"
+        if gdn_state_specs else "[:]")  # 空字典字面量必须是 [:]
     swift_path = out_path.parent / f"{out_path.stem}-swift-example.swift"
     swift_path.write_text(
-        _SWIFT_EXAMPLE_TEMPLATE.format(model_name=model_name, max_seq_len=max_seq_len,
-                                       output_name=output_name),
+        _SWIFT_EXAMPLE_TEMPLATE.format(model_name=model_name,
+                                       max_seq_len=max_seq_len,
+                                       max_seq_len_minus_1=max(max_seq_len - 1, 0),
+                                       output_name=output_name,
+                                       gdn_state_swift_literal=literal),
         encoding="utf-8")
     return swift_path
 
@@ -892,6 +936,7 @@ class CoremltoolsBackend:
             seq_attempt = max_seq_len
             requested_seq_len = max_seq_len
             quantized_bits = 0
+            gdn_state_specs = ()
             # 降级方案只有 1 个且首轮就失败时（非量化 + 长度已在下限），_post_convert
             # 不会被执行，这两个变量必须预先有值，否则保存阶段直接 NameError
             output_name = "logits"
@@ -969,15 +1014,30 @@ class CoremltoolsBackend:
                             libs.ct.utils.rename_feature(spec, old_name, "logits")
                         except Exception:
                             pass  # 个别格式不支持重命名时保留原名，示例会用真实输出名
+                # 混合架构的新状态输出默认是 cat_N 之类通用名，重命名为
+                # new_<state 名>：Swift 侧靠名字把它们回传为下一步输入。
+                # 输出顺序与 gdn_state_specs 一致（导出图按 conv→rec 返回）。
+                state_outs = [f for f in spec.description.output
+                              if f.name != "logits"]
+                for feature, (name, _, _) in zip(state_outs, gdn_state_specs):
+                    if feature.name != f"new_{name}":
+                        try:
+                            libs.ct.utils.rename_feature(spec, feature.name,
+                                                         f"new_{name}")
+                        except Exception:
+                            pass
                 input_descs = {
-                    "input_ids": f"Token ids (Int32)，形状 [1, q]，q ∈ 1..{seq_len}",
-                    "cache_position": f"各 token 的起始位置 (Int32)，长度 q ∈ 1..{seq_len}",
+                    "input_ids": "本步的 1 个 Token id (Int32)，形状 [1, 1]",
+                    "cache_position": f"该 token 的位置 (Int32)，形状 [1]，取值 0..{seq_len - 1}",
+                    "conv_states": "GDN 卷积状态 (Float)，上一步同名输出原样回传",
+                    "recurrent_states": "GDN 循环状态 (Float)，上一步同名输出原样回传",
                 }
-                output_descs = {f.name: f"词表 logits (Float)，形状 [1, q, vocab_size]，"
-                                        f"q ∈ 1..{seq_len}"
+                output_descs = {f.name: ("词表 logits (Float)，形状 [1, 1, vocab_size]"
+                                        if f.name == "logits" else
+                                        "下一步要回传的同名状态 (Float)")
                                 for f in spec.description.output}
                 _describe_spec(spec, f"由模型 '{self.source.name}' 转换"
-                                     f"（modconv + coremltools，KV cache 状态）",
+                                     f"（modconv + coremltools，单步 decode + KV cache 状态）",
                                input_descs, output_descs)
                 name = _first_output_name(spec)
                 # mlprogram 的 MLModel 不能仅从 spec 重建，必须带上原模型权重目录。
@@ -1024,6 +1084,7 @@ class CoremltoolsBackend:
                 # 回收——这是转换期能砍掉的最大一块内存，避免大模型触发 swap 而显得
                 # "卡死"（coremltools 转换时会持有自己的 fp16 权重副本）。
                 state_specs = wrapper.kv_state_specs()
+                gdn_state_specs = wrapper.gdn_state_specs()
                 traced_seq_len = wrapper.max_seq_len
                 del wrapper, model
                 gc.collect()
@@ -1039,11 +1100,12 @@ class CoremltoolsBackend:
                     # 就已经暴露：此时重试只浪费一次编译，不必等量化跑完才发现。
                     with _capture_ane_warnings() as caught:
                         mlmodel = _convert_to_coreml(libs, exported, state_specs,
-                                                     traced_seq_len)
+                                                     traced_seq_len, gdn_state_specs)
                 finally:
                     heartbeat.stop()
                 ane_msg = _unusable_model_message(caught)
                 # 导出图此后不再使用，尽早释放并回收，降低后续量化/保存阶段的峰值内存
+                # gdn_state_specs 留到后面写 Swift 示例（只是形状元信息，几十字节）
                 del exported, state_specs
                 gc.collect()
                 if hooks.should_cancel():
@@ -1098,7 +1160,7 @@ class CoremltoolsBackend:
             # 产物已是完整副本，临时包没有再留的必要（大模型上 GB 级）
             _drop_package(mlmodel)
             swift_path = _write_swift_example(out_path, self.source.name, max_seq_len,
-                                              output_name)
+                                              output_name, gdn_state_specs)
             hooks.on_log(f"已生成 Swift 调用示例: {swift_path}")
             files_done, bytes_done = _measure(out_path)
 
@@ -1106,7 +1168,8 @@ class CoremltoolsBackend:
             message = (f"coremltools 转换完成: {out_path} "
                        f"(stateful mlprogram 格式, KV cache 状态模型{bits_text}, "
                        f"{files_done} 个文件, {format_size(bytes_done)}, "
-                       f"输入长度 1..{max_seq_len}{reduced_note}, "
+                       f"单步 decode（每次 1 个 token，prefill 循环调用），"
+                       f"最大上下文 {max_seq_len}{reduced_note}, "
                        f"耗时 {time.monotonic() - start:.1f} 秒)")
             if unusable:
                 # 不能当成功交付：产物已落盘便于排查，但必须明确告知不可用

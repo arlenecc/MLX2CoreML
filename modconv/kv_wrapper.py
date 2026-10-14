@@ -393,6 +393,106 @@ def _qwen35_gdn_forward(self, hidden_states, cache_params, attention_mask=None, 
     return output
 
 
+def _qwen35_gdn_decode_forward(self, hidden_states, cache_params,
+                              attention_mask=None, **kwargs):
+    """Qwen3.5 GatedDeltaNet **单步 decode** 前向（每步一个 token）。
+
+    与 `_qwen35_gdn_forward` 的分块路径（chunk_gated_delta_rule）在单 token 时
+    数学等价，但计算形态完全不同：
+
+    分块路径要构造 (chunk, chunk) 的衰减矩阵（cumsum → pairwise exp → 63 步
+    Neumann 迭代求解三角系统），其中 `cumsum` 在 fp16 下随步数累积误差——实测
+    真实模型 g 每步达 -13.8、64 步后 cumsum 到 -373，fp16 的 ulp 已是 0.25，
+    衰减系数的相对误差达 30-65%，且 Core ML 的 FLOAT16 精度会抹掉内核内部的
+    fp32 cast，误差无法收敛；整段 unroll 后还占全图大部分算子（34k 节点），
+    是 ANE 执行计划构建失败（-14）与预测期编译卡死的主因。
+
+    单步下 delta rule 退化为一次秩一更新（参考 ref/CoreML-LLM 的
+    `MLKVLinearAttnDecodeStep`）：
+
+        rec   = rec * exp(g)                 # 衰减
+        kv_mem = (rec * k).sum(-2)           # 读记忆
+        delta  = (v - kv_mem) * beta         # delta 修正
+        rec    = rec + k ⊗ delta             # 秩一更新
+        out    = (rec * q).sum(-2)           # 读出
+
+    没有 cumsum、没有 pairwise 矩阵、没有三角求解——fp16 下数值良态，算子数从
+    每层数百降到十余个。conv state 用 cat + K 点乘（等价 F.conv1d 的因果卷积）。
+
+    conv/rec state 由 wrapper 通过 cache slot 传入（本函数读取
+    `layer_cache.conv_states[0]` / `recurrent_states[0]`），新 state 写回同一
+    slot 供 wrapper 收集为图输出（不再是 MLState，见 MLState 数量教训）。
+    """
+    import torch.nn.functional as F
+    from transformers.activations import ACT2FN
+
+    layer_cache = cache_params.layers[self.layer_idx]
+    conv_state = layer_cache.conv_states[0]        # (1, conv_dim, K)
+    rec_state = layer_cache.recurrent_states[0]    # (1, num_v, Dk, Dv)
+
+    batch_size, seq_len, _ = hidden_states.shape   # 单步：seq_len == 1
+    dtype = hidden_states.dtype
+
+    mixed_qkv = self.in_proj_qkv(hidden_states)    # (1, 1, conv_dim)
+    z = self.in_proj_z(hidden_states)
+    b = self.in_proj_b(hidden_states)
+    a = self.in_proj_a(hidden_states)
+
+    # ---- 因果卷积（单步：K 个 tap 与卷积权重点积）----
+    # 等价 HF 的 causal_conv1d_fn（F.conv1d(padding=K-1) 取最后一个位置）：
+    # out[t] = Σ_j w[j] · x[t-K+1+j]，w 为"最旧在前"的卷积核。
+    kernel = int(self.conv_kernel_size)
+    kw = self.conv1d.weight.squeeze(1)             # (conv_dim, K)
+    stream = mixed_qkv.transpose(1, 2).to(conv_state.dtype)   # (1, conv_dim, 1)
+    w = torch.cat([conv_state, stream], dim=2)     # (1, conv_dim, K+1)
+    taps = w[:, :, 1:]                             # (1, conv_dim, K)
+    conv_out = (taps * kw.unsqueeze(0).to(taps.dtype)).sum(dim=-1, keepdim=True)
+    if self.conv1d.bias is not None:
+        conv_out = conv_out + self.conv1d.bias.view(1, -1, 1).to(conv_out.dtype)
+    conv_out = ACT2FN[self.activation](conv_out)
+    # 滚动窗口：去掉最旧一列，保留当前 token
+    layer_cache.conv_states[0] = taps
+    mixed_qkv = conv_out.transpose(1, 2)           # (1, 1, conv_dim)
+
+    query, key, value = torch.split(
+        mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+    query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
+    key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+    value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+
+    beta = b.sigmoid()
+    # 稳定 softplus + exp(A_log)：F.softplus 在 Core ML 的 fp16 图里会产生 NaN
+    g = -self.A_log.float().exp() * _stable_softplus(a.float() + self.dt_bias)
+    v_per_k = int(self.num_v_heads) // int(self.num_k_heads)
+    if v_per_k > 1:
+        query = query.repeat_interleave(v_per_k, dim=2)
+        key = key.repeat_interleave(v_per_k, dim=2)
+
+    # ---- 单步 delta rule（全部在 fp32 下计算，出口 cast 回模型精度）----
+    q_ = query.float()[0, 0]                        # (num_v, Dk)
+    k_ = key.float()[0, 0]                          # (num_v, Dk)
+    v_ = value.float()[0, 0]                        # (num_v, Dv)
+    q_ = _l2norm(q_, dim=-1, eps=1e-6) * (float(self.head_k_dim) ** -0.5)
+    k_ = _l2norm(k_, dim=-1, eps=1e-6)
+    decay = g.float()[0, 0].exp().unsqueeze(-1).unsqueeze(-1)   # (num_v, 1, 1)
+    beta_ = beta.float()[0, 0].unsqueeze(-1)                    # (num_v, 1)
+
+    rec = rec_state.float()[0] * decay                          # (num_v, Dk, Dv)
+    kv_mem = (rec * k_.unsqueeze(-1)).sum(dim=-2)               # (num_v, Dv)
+    delta = (v_ - kv_mem) * beta_                               # (num_v, Dv)
+    rec = rec + k_.unsqueeze(-1) * delta.unsqueeze(-2)          # 秩一更新
+    core_attn_out = (rec * q_.unsqueeze(-1)).sum(dim=-2)        # (num_v, Dv)
+
+    layer_cache.recurrent_states[0] = rec.unsqueeze(0).to(rec_state.dtype)
+
+    # 门控 RMSNorm + 输出投影（与 HF 原版一致）
+    core_attn_out = core_attn_out.reshape(-1, self.head_v_dim).to(dtype)
+    z = z.reshape(-1, self.head_v_dim)
+    core_attn_out = self.norm(core_attn_out, z)
+    core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+    return self.out_proj(core_attn_out)
+
+
 def _qwen35_text_rope_forward(self, x, position_ids):
     """Qwen3_5TextRotaryEmbedding.forward 的纯文本等价实现。
 
@@ -508,8 +608,13 @@ class KvCacheWrapper(nn.Module):
                                 or config.num_attention_heads)
         self.head_dim = int(getattr(config, "head_dim", None)
                             or config.hidden_size // config.num_attention_heads)
-        # state buffer 名单（按注册顺序，与 named_buffers 一致）
+        # state buffer 名单（按注册顺序，与 named_buffers 一致）。混合架构下只有
+        # kv_all：GDN 的 conv/rec 走图 I/O（见 gdn_state_specs 说明）
         self._state_names: list[str] = []
+        self._gdn_slots: list[int] = []
+        self._conv_shape: tuple[int, ...] = ()
+        self._rec_shape: tuple[int, ...] = ()
+        self._managed_states: list | None = None
 
         # 混合架构检测：layer_types 中非 full/sliding/chunked 的层视为 linear attention
         layer_types = list(getattr(config, "layer_types", None) or [])
@@ -589,16 +694,14 @@ class KvCacheWrapper(nn.Module):
             # 前两个内核函数从 mixer 所属模型模块解析（dense / MoE 各一份），追踪
             # 前固定；分块内核用本模块的导出适配版本（原版有两处在 Core ML 的 fp16
             # 图里算错，见 _modconv_chunk_gated_delta_rule 文档）
-            kernels_mod = importlib.import_module(type(mixer).__module__)
-            mixer._modconv_kernels = (kernels_mod.apply_mask_to_padding_states,
-                                      kernels_mod.causal_conv1d_fn,
-                                      _modconv_chunk_gated_delta_rule)
-            mixer.forward = MethodType(_qwen35_gdn_forward, mixer)
+            # 单步 decode 前向：conv/rec state 走图 I/O（见函数文档）
+            mixer.forward = MethodType(_qwen35_gdn_decode_forward, mixer)
 
-        # 全部 GDN 层的 conv/rec state 各合并为单个大 buffer（与 kv_all 同理：
-        # 规避 ANE 的 state 数量上限 -14）。层 slot 的视图在 _qwen35_gdn_forward
-        # 内现算并刷新到 conv_states[0]/recurrent_states[0]（in-place 写落回基
-        # buffer），此处只注入基 buffer 引用与 slot，不预存视图（会被 export 当常量）。
+        # GDN 的 conv/rec state **不再是 MLState**：参考 ref/CoreML-LLM 在同架构
+        # 上的实测结论——每个 chunk 超过 1~2 个 ct.StateType 时，Core ML 的 CPU
+        # runtime 会误编译 slice_update（输出 garbage/NaN），ANE 侧则在 predict
+        # 期报 Error 11。因此只把最大的 KV 缓存留在 MLState（kv_all，单个
+        # StateType），conv/rec 改为图的输入/输出张量，由调用方逐步传递。
         idx_list = sorted(mixers)
         first = mixers[idx_list[0]]
         kernel = int(first.conv_kernel_size)
@@ -611,20 +714,14 @@ class KvCacheWrapper(nn.Module):
                     or int(mx.key_dim) * 2 + int(mx.value_dim) != conv_dim
                     or (int(mx.num_v_heads), int(mx.head_k_dim),
                         int(mx.head_v_dim)) != rec_shape):
-                raise RuntimeError(f"第 {i} 层 GDN state 形状不一致，无法合并为共享 buffer")
-        self.register_buffer("conv_all", torch.zeros(
-            (len(idx_list), conv_dim, kernel), dtype=self.buffer_dtype, device=param.device))
-        self.register_buffer("rec_all", torch.zeros(
-            (len(idx_list),) + rec_shape, dtype=self.buffer_dtype, device=param.device))
-        self._state_names.extend(["conv_all", "rec_all"])
-        for slot, i in enumerate(idx_list):
+                raise RuntimeError(f"第 {i} 层 GDN state 形状不一致，无法合并为共享张量")
+        # 形状与 dtype 记录，供 gdn_state_specs() 声明图的输入/输出
+        self._gdn_slots = idx_list
+        self._conv_shape = (len(idx_list), conv_dim, kernel)
+        self._rec_shape = (len(idx_list),) + rec_shape
+        for i in idx_list:
             layer = self._cache.layers[i]
-            layer._conv_base = self.conv_all
-            layer._conv_slot = slot
-            layer._rec_base = self.rec_all
-            layer._rec_slot = slot
-            # 标记已初始化/有历史（追踪期走既定分支，不触发懒初始化；
-            # buffer 全零 = 全新会话语义）
+            # 标记已初始化/有历史（追踪期走既定分支，不触发懒初始化）
             layer.is_conv_states_initialized[0] = True
             layer.is_recurrent_states_initialized[0] = True
             layer.has_previous_state[0] = True
@@ -642,19 +739,56 @@ class KvCacheWrapper(nn.Module):
         return [(name, tuple(getattr(self, name).shape), "float16")
                 for name in self._state_names]
 
+    def gdn_state_specs(self) -> list[tuple[str, tuple[int, ...], str]]:
+        """GDN 的 conv/rec state 规格 [(名, 形状, dtype)]——作为**图的输入/输出**。
+
+        混合架构下这两个 state 每步都要读写。参考 ref/CoreML-LLM 在同架构上的
+        实测：MLState 数量超过 1~2 个会让 Core ML 的 CPU runtime 误编译
+        slice_update（输出 garbage/NaN）、ANE 侧 predict 期报 Error 11，因此
+        它们不进 MLState，而是随每步调用显式传入/传出（由 Swift 侧字典持有）。
+        """
+        if not self._hybrid:
+            return []
+        return [("conv_states", tuple(self._conv_shape), "float32"),
+                ("recurrent_states", tuple(self._rec_shape), "float32")]
+
     def state_buffers(self) -> list[torch.Tensor]:
         return [getattr(self, name) for name, _, _ in self.kv_state_specs()]
 
     def reset_state(self) -> None:
         for buf in self.state_buffers():
             buf.zero_()
+        self._managed_states = None
+
+    # ---------------------------------------------------------------- #
+    # 托管步进（torch 参考/测试用；导出图走 forward 的显式 state 参数）
+    # ---------------------------------------------------------------- #
+    def step(self, input_ids: torch.Tensor, cache_position: torch.Tensor):
+        """逐步前向并内部维护 GDN state，返回 logits (1, 1, vocab)。
+
+        导出图每次只推进一个 token（prefill 由调用方循环调用同一张图完成，
+        与 ref/CoreML-LLM 的 recurrent prefill 一致），这里把它包成连续接口。
+        """
+        if not self._hybrid:
+            return self.forward(input_ids, cache_position)
+        param = next(self.inner.parameters())
+        if self._managed_states is None:
+            self._managed_states = [
+                torch.zeros(self._conv_shape, dtype=self.buffer_dtype,
+                            device=param.device),
+                torch.zeros(self._rec_shape, dtype=self.buffer_dtype,
+                            device=param.device),
+            ]
+        conv, rec = self._managed_states
+        logits, conv, rec = self.forward(input_ids, cache_position, conv, rec)
+        self._managed_states = [conv.detach(), rec.detach()]
+        return logits
 
     def _hidden_states(self, ids, positions, cache_position, mask):
-        """混合架构路径的主干前向（不含 lm_head）；结构不适用时返回 None。
+        """主干前向（不含 lm_head）；结构不适用时返回 None。
 
-        pad 到 max_seq_len 只为静态化 GDN 分块循环，输出只需真实的前 q 个位置；
-        lm_head 逐位置独立，因此先切再算比先算再切省掉整个 (max_seq_len, vocab)
-        的中间张量（见 forward 内注释）。
+        先取主干再单独算 lm_head：结构上更清晰，且便于在混合架构下把 logits
+        投影留在图内（单步输出只有 (1, 1, vocab)，不再需要按长度切分）。
         """
         base = getattr(self.inner, "model", None)
         if base is None or not hasattr(self.inner, "lm_head"):
@@ -665,9 +799,21 @@ class KvCacheWrapper(nn.Module):
         return getattr(out, "last_hidden_state", None)
 
     # ---------------------------------------------------------------- #
-    # 前向：input_ids (1, q) + cache_position (q,) → logits (1, q, vocab)
+    # 前向：单步——input_ids (1, 1) + cache_position (1,) → logits (1, 1, vocab)
     # ---------------------------------------------------------------- #
-    def forward(self, input_ids: torch.Tensor, cache_position: torch.Tensor):
+    def forward(self, input_ids: torch.Tensor, cache_position: torch.Tensor,
+                conv_states: torch.Tensor | None = None,
+                recurrent_states: torch.Tensor | None = None):
+        """推进**一个** token；混合架构额外接收并返回 conv/rec state 张量。
+
+        为什么只走单步：混合架构的 GDN 分块内核（chunk_gated_delta_rule）要按
+        序列长度展开 63 步三角求解循环，fp16 下的 cumsum 误差随步数放大（实测
+        真实模型衰减系数误差 30-65%），且整段 unroll 后算子数达 3 万级——是
+        ANE 执行计划构建失败（-14）、预测期编译卡死和精度发散的共同根源。
+        单步下 delta rule 退化为一次秩一更新（见 `_qwen35_gdn_decode_forward`），
+        算子数两个数量级地下降，fp16 数值良态。prefill 由调用方循环调用同一张
+        图完成（recurrent prefill，与 ref/CoreML-LLM 的做法一致）。
+        """
         # 每层游标重绑定为 cache_position 起点（输入派生）：_SlotStaticLayer.update
         # 用 arange(kv) + 游标定位写入槽位；不做 in-place 累加（见 _SlotStaticLayer
         # 文档），因此导出图中的槽位始终由 cache_position 推导，decode 不会写错槽。
@@ -676,90 +822,46 @@ class KvCacheWrapper(nn.Module):
             if isinstance(layer, StaticLayer):
                 layer.cumulative_length = start.clone()
 
-        if not self._hybrid:
-            # 静态形状因果掩码 (1, 1, q, L)：查询 i 允许看见槽位 0..cache_position[i]。
-            # 传入已是 4D 的 attention_mask 时，HF create_causal_mask 会 early-exit 原样
-            # 返回（masking_utils._preprocess_mask_arguments），完全绕开其动态掩码机器——
-            # 该机器在导出图中产生"运行时 reps 的 tile"（全符号 bool 输出），是 ANE
-            # 执行计划构建失败（-14）的根因。arange/比较的广播形状均可静态推断。
-            # 掩码值用"布尔 cast 后乘 min"构造而不用 torch.where：coremltools 的 MIL
-            # select 在 a/b 为标量时 type_inference 只广播 a/b、忽略 cond 的形状，输出
-            # 退化为标量，运行时掩码会被整个丢掉（add 变成加 0）。
-            # min 取 fp16 的 -65504 而非本 dtype 的 finfo.min：fp32 的 -3.4e38 在 fp16
-            # 计算里溢出为 -inf，Core ML softmax 会产生 NaN；-65504 在两种精度下均为
-            # 有限值且 exp(-65504) 下溢为 0，掩码语义不变。
-            # position_ids（仅 Qwen3.5）传 (4, 1, q)：TextModel 对 3D/shape[0]==4
-            # 的输入只做 slice 取 text/rope 份；若不传（内部 arange）或传 2D，其
-            # 内部的 ``view(1,1,-1).expand(4, bs, -1)`` 在 q 动态时会让 coremltools
-            # 前端把 expand 输出的静态 4/1 维也符号化，沿广播链污染整图（KV
-            # scatter 的 data/indices batch 维不匹配断言失败）。cat 复制 4 份即
-            # 等价于该 expand 的语义（text + T/H/W 四份，纯文本下全相同）。
-            # 其他架构既无此缺陷也不接受 3D 位置（Llama 会把 (4,1,q) 广播进
-            # rotary，使 K/V 多出一个 mrope 维），必须保持不传。
-            kwargs = {}
-            if self._qwen35_mrope_positions:
-                pos3d = cache_position.reshape(1, 1, -1)
-                kwargs["position_ids"] = torch.cat(
-                    [pos3d, pos3d, pos3d, pos3d], dim=0)
-            slots = torch.arange(self.max_seq_len, device=input_ids.device)
-            blocked = slots[None, None, None, :] > cache_position.reshape(-1)[None, None, :, None]
-            mask = blocked.to(self.kv_dtype) * torch.finfo(torch.float16).min
+        if self._hybrid:
+            # 本步的 conv/rec state 视图挂到各 GDN 层的 cache slot（切片是输入张量
+            # 的视图，可被 export 追踪）；GDN 前向读旧值、写新值到同一 slot。
+            for slot, i in enumerate(self._gdn_slots):
+                layer = self._cache.layers[i]
+                layer.conv_states[0] = conv_states[slot:slot + 1]
+                layer.recurrent_states[0] = recurrent_states[slot:slot + 1]
+
+        # position_ids（仅 Qwen3.5）传 (4, 1, 1)：TextModel 对 3D/shape[0]==4
+        # 的输入只做 slice 取 text/rope 份；若不传（内部 arange）或传 2D，其内部的
+        # view(1,1,-1).expand(4, bs, -1) 在长度动态时会让 coremltools 前端把静态
+        # 维也符号化，沿广播链污染整图。cat 复制 4 份即等价该 expand 的语义。
+        kwargs = {}
+        if self._qwen35_mrope_positions:
+            pos3d = cache_position.reshape(1, 1, -1)
+            kwargs["position_ids"] = torch.cat([pos3d, pos3d, pos3d, pos3d], dim=0)
+        # 静态形状因果掩码 (1, 1, 1, L)：当前 token（位置 cache_position）可见槽位
+        # 0..cache_position。传入已是 4D 的 mask 时 HF create_causal_mask 会
+        # early-exit 原样返回，绕开其动态掩码机器（该机器在导出图中产生运行时
+        # reps 的 tile，是 -14 的根因之一）。掩码值用 fp16 的 -65504 而非
+        # finfo.min：fp32 的 -3.4e38 在 fp16 下溢出为 -inf，softmax 会产生 NaN。
+        slots = torch.arange(self.max_seq_len, device=input_ids.device)
+        blocked = slots[None, None, None, :] > cache_position.reshape(-1)[None, None, :, None]
+        mask = blocked.to(self.kv_dtype) * torch.finfo(torch.float16).min
+
+        hidden = self._hidden_states(input_ids, kwargs.get("position_ids"),
+                                     cache_position, mask)
+        if hidden is None:  # 拿不到主干（非常规 CausalLM 结构）：退回整图算 logits
             out = self.inner(input_ids=input_ids, cache_position=cache_position,
                              attention_mask=mask, past_key_values=self._cache,
                              use_cache=True, **kwargs)
-            return out.logits
-
-        # ---- 混合架构：pad 到固定 max_seq_len 静态前向 ----
-        # GDN 分块内核的 chunk 循环次数取决于序列长度（动态值无法导出），pad 成
-        # 常量后所有 seq_len 相关分支在追踪期静态消除。KV 写入索引由
-        # _SlotStaticLayer clamp 到缓冲范围内（见其文档）。
-        q = input_ids.shape[1]
-        dev = input_ids.device
-        # 用 scatter 把真实 token/位置写进静态 (1, max_seq_len) 缓冲的前 q 个槽位
-        # （其余槽位为 0），得到静态形状的 ids/positions。不能用
-        # cat([input_ids, pad 切片]) 拼接：动态长度切片的输出在 MIL 前端是符号
-        # 长度 (max - q)，concat 无法静态折叠 q + (max - q) = max，符号长度沿
-        # 整个计算图泄漏到 rope 与 K/V，scatter 写 state 时与静态缓冲形状断言
-        # 冲突。也不能用 torch.zeros((1, pad_len)) 直接构造 pad：dynamo 对工厂
-        # 函数（zeros/full/empty）的符号尺寸有"非零"假设，会生成 pad_len >= 1
-        # 守卫，使 q = max_seq_len 的完整 prefill 无法导出。scatter 写入的索引
-        # 长度沿 axis 可与缓冲不同，与非 hybrid 路径的 KV state 写入同构。
-        slot = torch.arange(q, device=dev).unsqueeze(0)  # (1, q) 动态长度索引
-        ids = torch.zeros((1, self.max_seq_len), dtype=input_ids.dtype,
-                          device=dev).scatter(1, slot, input_ids)
-        # pad 槽位位置补 0：pad query 行的输出会被切掉；pad K/V 写入的槽位在
-        # 真实 query 读到之前必被真实 token 覆写（生成按位置递增推进）。
-        positions = torch.zeros((1, self.max_seq_len), dtype=torch.long,
-                                device=dev).scatter(
-            1, slot, cache_position.reshape(1, -1).long())
-        # 掩码 key 轴必须是 KV 缓冲的"槽位索引"（buffer 按位置索引槽位，槽位 j 存
-        # 位置 j 的 K/V）：查询 i（位置 positions[i]）允许看见槽位 0..positions[i]。
-        # 不能用 positions 做 key 轴——decode 时 positions=[5..20] 与槽位号错开，
-        # 会让真实 query 只看到槽位 0；prefill（start=0）两者恰好重合所以不易暴露。
-        # pad query 行的输出会被 logits[:, :q] 切掉，其掩码行取值无影响。
-        slots = torch.arange(self.max_seq_len, device=dev)
-        blocked = slots[None, None, None, :] > positions.reshape(-1)[None, None, :, None]
-        mask = blocked.to(self.kv_dtype) * torch.finfo(torch.float16).min
-        # Qwen3.5 的 TextModel 忽略 cache_position、用 get_seq_length() 推位置
-        #（混合 cache 下不可靠），必须显式传 position_ids；llama 系模型收到
-        # 一致的 position_ids 也无副作用。
-        hidden = self._hidden_states(ids, positions, cache_position, mask)
-        if hidden is None:  # 拿不到主干（非常规 CausalLM 结构）：退回整图算 logits
-            out = self.inner(input_ids=ids, position_ids=positions,
-                             cache_position=cache_position, attention_mask=mask,
-                             past_key_values=self._cache, use_cache=True)
-            hidden = out.logits
-            head = None
+            logits = out.logits
         else:
-            head = self.inner.lm_head
-        # 切回真实长度。不能直接 hidden[:, :q]：动态 end 的 slice 在 end 可等于
-        # 维度上限时（q = max_seq_len 合法输入）会生成 "end != size" 守卫，违反
-        # 1..max 动态范围声明，导出报错。先 cat 一列 dummy 使维度上限变为 max+1，
-        # 切片 end 恒小于上限，守卫静态成立、不会加入图约束。
-        dummy = torch.zeros((1, 1, hidden.shape[-1]), dtype=hidden.dtype, device=dev)
-        hidden = torch.cat([hidden, dummy], dim=1)[:, :q]
-        # lm_head 逐位置独立，先切回真实长度再算 logits 与"先算整段再切"完全等价，
-        # 但后者要为 pad 位置也算一份 (max_seq_len, vocab) 的 logits——词表 248320、
-        # 长度 512 时单张量 fp32 达 508MB，是图里最大的中间结果，既白算 pad 部分
-        # 也容易让 ANE 执行计划构建失败（-14）。
-        return hidden if head is None else head(hidden)
+            logits = self.inner.lm_head(hidden)
+
+        if not self._hybrid:
+            return logits
+        # 收集各 GDN 层写回的新 state（GDN 前向已把新值赋回 cache slot）
+        new_conv = torch.cat([self._cache.layers[i].conv_states[0]
+                              for i in self._gdn_slots], dim=0)
+        new_rec = torch.cat([self._cache.layers[i].recurrent_states[0]
+                             for i in self._gdn_slots], dim=0)
+        return logits, new_conv, new_rec

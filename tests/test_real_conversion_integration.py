@@ -124,7 +124,10 @@ def _convert_and_check_spec(tmp_path):
 
     spec = ct.utils.load_spec(str(out_path))
     # stateful 动态长度输入：input_ids + cache_position
-    assert [i.name for i in spec.description.input] == ["input_ids", "cache_position"]
+    names = [i.name for i in spec.description.input]
+    assert names[:2] == ["input_ids", "cache_position"]
+    # 混合架构（含 linear attention 层）额外带 GDN 的 conv/rec 状态输入
+    assert set(names[2:]) <= {"conv_states", "recurrent_states"}, names
     assert spec.description.output, "应有输出"
     # Swift 友好性：输出名应为 logits，且元数据/描述非空
     assert spec.description.output[0].name == "logits", "输出应重命名为 logits"
@@ -144,6 +147,56 @@ def _predict(m, state, ids_np, pos_np):
     return np.asarray(out["logits"], dtype=np.float32)
 
 
+def _gdn_zero_states(spec):
+    """混合架构的 GDN 状态零初始化字典（名称与形状取自 spec 的输入）。"""
+    import numpy as np
+
+    zeros = {}
+    for feature in spec.description.input:
+        if feature.name in ("input_ids", "cache_position"):
+            continue
+        shape = tuple(int(d) for d in feature.type.multiArrayType.shape)
+        zeros[feature.name] = np.zeros(shape, dtype=np.float32)
+    return zeros
+
+
+class _Stepper:
+    """单步 decode 模型的连续推进器：prefill 逐 token，GDN 状态逐步回传。
+
+    转换产物每次只推进一个 token（recurrent prefill），推理侧需要把上一步输出的
+    new_conv_states / new_recurrent_states 传回下一步。
+    """
+
+    def __init__(self, model, state=None):
+        self.model = model
+        self.state = state if state is not None else model.make_state()
+        spec = model.get_spec()
+        self.gdn = _gdn_zero_states(spec)
+
+    def __call__(self, token, position):
+        import numpy as np
+
+        feed = {"input_ids": np.array([[token]], dtype=np.int32),
+                "cache_position": np.array([position], dtype=np.int32)}
+        feed.update(self.gdn)
+        out = self.model.predict(feed, self.state)
+        # 收集新状态：输出名可能是 new_<name>（传入 dict 时返回 dict）
+        for name in list(self.gdn):
+            for key in (name, f"new_{name}"):
+                if key in out:
+                    self.gdn[name] = np.asarray(out[key], dtype=np.float32).reshape(
+                        self.gdn[name].shape)
+                    break
+        return np.asarray(out["logits"], dtype=np.float32)
+
+    def prefill(self, tokens, start=0):
+        """逐 token 推进整段 prompt，返回最后一个位置的 logits。"""
+        logits = None
+        for i, token in enumerate(tokens):
+            logits = self(int(token), start + i)
+        return logits
+
+
 def test_probe_and_real_conversion_end_to_end(tmp_path):
     import numpy as np
 
@@ -161,23 +214,20 @@ def test_probe_and_real_conversion_end_to_end(tmp_path):
 
     import coremltools as ct
     mlmodel = ct.models.MLModel(str(out_path), compute_units=ct.ComputeUnit.ALL)
-    state = mlmodel.make_state()
+    stepper = _Stepper(mlmodel)
 
-    # prefill：整段 prompt 一次前向，q ∈ 1..8
-    logits = _predict(mlmodel, state, np.array([[1, 2, 3, 4]], dtype=np.int32),
-                      np.arange(4, dtype=np.int32))
-    assert logits.shape == (1, 4, 128)
+    # prefill：逐 token 推进（单步 decode 图），只看最后一个位置
+    logits = stepper.prefill([1, 2, 3, 4])
+    assert logits.shape == (1, 1, 128)
     assert np.isfinite(logits).all(), "logits 不应含 NaN/Inf"
 
     # decode：单 token，KV cache 由 state 携带
-    next_logits = _predict(mlmodel, state, np.array([[5]], dtype=np.int32),
-                           np.array([4], dtype=np.int32))
+    next_logits = stepper(5, 4)
     assert next_logits.shape == (1, 1, 128)
 
     # state 语义：空 state 的同一 decode 输出必须与有 cache 时不同
-    empty_logits = _predict(mlmodel, mlmodel.make_state(),
-                            np.array([[5]], dtype=np.int32),
-                            np.array([4], dtype=np.int32))
+    empty = _Stepper(mlmodel, mlmodel.make_state())
+    empty_logits = empty(5, 4)
     assert np.abs(next_logits - empty_logits).max() > 1e-3, \
         "空 state 的 decode 与有 cache 时相同，KV cache state 未生效"
 
@@ -288,8 +338,15 @@ def test_qwen35_hybrid_conversion_end_to_end(tmp_path):
     assert out_path is not None and out_path.name == "tiny-qwen35.mlpackage"
 
     spec = ct.utils.load_spec(str(out_path))
-    assert [i.name for i in spec.description.input] == ["input_ids", "cache_position"]
+    names = [i.name for i in spec.description.input]
+    # 单步 decode：input_ids/cache_position + 混合架构的 GDN 状态（走图 I/O）
+    assert names[:2] == ["input_ids", "cache_position"]
+    assert names[2:] == ["conv_states", "recurrent_states"], names
     assert spec.description.output[0].name == "logits"
+    # GDN 新状态输出：供下一步回传
+    out_names = [o.name for o in spec.description.output]
+    assert out_names == ["logits", "new_conv_states", "new_recurrent_states"], \
+        out_names
     _assert_4bit_palettized(spec)
 
     # 推理验证仅在 coremltools 原生运行库可用时执行
@@ -304,25 +361,21 @@ def test_qwen35_hybrid_conversion_end_to_end(tmp_path):
     import numpy as np
 
     mlmodel = ct.models.MLModel(str(out_path), compute_units=ct.ComputeUnit.ALL)
-    state = mlmodel.make_state()
-
-    def predict(ids, pos):
-        o = mlmodel.predict({"input_ids": np.array(ids, dtype=np.int32),
-                             "cache_position": np.array(pos, dtype=np.int32)}, state)
-        return np.asarray(o["logits"], dtype=np.float32)
+    stepper = _Stepper(mlmodel)
 
     # prefill 4 token + 两步 decode，全程有限值
-    logits = predict([[1, 2, 3, 4]], np.arange(4))
-    assert logits.shape == (1, 4, 128)
+    logits = stepper.prefill([1, 2, 3, 4])
+    assert logits.shape == (1, 1, 128)
     assert np.isfinite(logits).all()
-    next1 = predict([[5]], [4])
+    next1 = stepper(5, 4)
     assert next1.shape == (1, 1, 128)
-    next2 = predict([[6]], [5])
+    next2 = stepper(6, 5)
     assert np.isfinite(next2).all(), "多步 decode 后 logits 不应含 NaN/Inf"
 
     # state 语义：空 state 的同输入 decode 必须与有 cache 时不同
-    #（full 层 KV 与 GDN conv/recurrent state 均由 state 携带）
-    empty = predict([[5]], [4])
+    #（full 层 KV 由 MLState 携带，GDN conv/rec 由逐步回传的张量携带）
+    # 空 state 下只喂位置 4 的 token 5：没有 1..4 的历史，输出必然不同
+    empty = _Stepper(mlmodel, mlmodel.make_state())(5, 4)
     assert np.abs(next1 - empty).max() > 1e-3, \
         "空 state 的 decode 与有 cache 时相同，hybrid state 未生效"
 
@@ -349,7 +402,10 @@ def test_qwen35_config_variants_end_to_end(tmp_path, variant):
     assert result.success is True, result.message
 
     spec = ct.utils.load_spec(str(result.output_path))
-    assert [i.name for i in spec.description.input] == ["input_ids", "cache_position"]
+    names = [i.name for i in spec.description.input]
+    assert names[:2] == ["input_ids", "cache_position"]
+    # 混合架构（含 linear attention 层）额外带 GDN 的 conv/rec 状态输入
+    assert set(names[2:]) <= {"conv_states", "recurrent_states"}, names
     assert spec.description.output[0].name == "logits"
     _assert_4bit_palettized(spec)
 
@@ -372,20 +428,21 @@ def test_qwen35_config_variants_end_to_end(tmp_path, variant):
                            "cache_position": np.array(pos, dtype=np.int32)}, state)
         return np.asarray(o["logits"], dtype=np.float32)
 
-    # 连续 decode（prefill 4 + 逐步 decode 2）与一次 prefill 6 的最后位一致性
-    state = mlmodel.make_state()
-    pre = predict(mlmodel, state, [[1, 2, 3, 4]], [0, 1, 2, 3])
-    assert pre.shape == (1, 4, 128) and np.isfinite(pre).all()
-    dec1 = predict(mlmodel, state, [[5]], [4])
-    dec2 = predict(mlmodel, state, [[6]], [5])
+    # 连续 decode（prefill 4 + 逐步 decode 2）与一次 prefill 6 的最后位一致性。
+    # 单步模型没有"整段 prefill"这一路，对照值也用同一张图逐 token 推进得到。
+    stepper = _Stepper(mlmodel)
+    pre = stepper.prefill([1, 2, 3, 4])
+    assert pre.shape == (1, 1, 128) and np.isfinite(pre).all()
+    dec1 = stepper(5, 4)
+    dec2 = stepper(6, 5)
     assert np.isfinite(dec2).all(), "多步 decode 后 logits 不应含 NaN/Inf"
-    whole = predict(mlmodel, mlmodel.make_state(), [[1, 2, 3, 4, 5, 6]],
-                    [0, 1, 2, 3, 4, 5])
-    assert np.abs(whole[:, -1, :] - dec2[0, 0, :]).max() < 0.05, \
+    whole_stepper = _Stepper(mlmodel, mlmodel.make_state())
+    whole = whole_stepper.prefill([1, 2, 3, 4, 5, 6])
+    assert np.abs(whole[0, 0, :] - dec2[0, 0, :]).max() < 0.05, \
         "连续 decode 与整段 prefill 的末位 logits 不一致，KV cache 推进有误"
 
     # state 语义：空 state 的同输入 decode 必须与有 cache 时不同
-    empty = predict(mlmodel, mlmodel.make_state(), [[5]], [4])
+    empty = _Stepper(mlmodel, mlmodel.make_state())(5, 4)
     assert np.abs(dec1 - empty).max() > 1e-3, \
         "空 state 的 decode 与有 cache 时相同，state 未生效"
 
@@ -442,9 +499,8 @@ def test_max_seq_len_one_export_and_convert(tmp_path):
         return
     mlmodel = ct.models.MLModel(str(result.output_path),
                                 compute_units=ct.ComputeUnit.ALL)
-    logits = mlmodel.predict({"input_ids": np.asarray([[7]], dtype=np.int32),
-                              "cache_position": np.asarray([0], dtype=np.int32)},
-                             mlmodel.make_state())["logits"]
+    stepper = _Stepper(mlmodel)
+    logits = stepper(7, 0)
     assert np.asarray(logits, dtype=np.float32).shape == (1, 1, 128)
     assert np.isfinite(np.asarray(logits, dtype=np.float32)).all()
 
@@ -471,7 +527,10 @@ def test_qwen35_moe_conversion_end_to_end(tmp_path):
     assert result.success is True, result.message
 
     spec = ct.utils.load_spec(str(result.output_path))
-    assert [i.name for i in spec.description.input] == ["input_ids", "cache_position"]
+    names = [i.name for i in spec.description.input]
+    assert names[:2] == ["input_ids", "cache_position"]
+    # 混合架构（含 linear attention 层）额外带 GDN 的 conv/rec 状态输入
+    assert set(names[2:]) <= {"conv_states", "recurrent_states"}, names
     assert spec.description.output[0].name == "logits"
     _assert_4bit_palettized(spec)
 
@@ -483,24 +542,18 @@ def test_qwen35_moe_conversion_end_to_end(tmp_path):
     mlmodel = ct.models.MLModel(str(result.output_path),
                                 compute_units=ct.ComputeUnit.ALL)
 
-    def predict(model, state, ids, pos):
-        o = model.predict({"input_ids": np.asarray(ids, dtype=np.int32),
-                           "cache_position": np.asarray(pos, dtype=np.int32)}, state)
-        return np.asarray(o["logits"], dtype=np.float32)
-
-    state = mlmodel.make_state()
-    pre = predict(mlmodel, state, [[1, 2, 3, 4]], [0, 1, 2, 3])
-    assert pre.shape == (1, 4, 128) and np.isfinite(pre).all()
-    dec1 = predict(mlmodel, state, [[5]], [4])
-    dec2 = predict(mlmodel, state, [[6]], [5])
+    stepper = _Stepper(mlmodel)
+    pre = stepper.prefill([1, 2, 3, 4])
+    assert pre.shape == (1, 1, 128) and np.isfinite(pre).all()
+    dec1 = stepper(5, 4)
+    dec2 = stepper(6, 5)
     assert np.isfinite(dec2).all(), "多步 decode 后 logits 不应含 NaN/Inf"
     # 连续 decode 与整段 prefill 的末位一致性（KV/state 推进正确）
-    whole = predict(mlmodel, mlmodel.make_state(), [[1, 2, 3, 4, 5, 6]],
-                    [0, 1, 2, 3, 4, 5])
-    assert np.abs(whole[:, -1, :] - dec2[0, 0, :]).max() < 0.05, \
+    whole = _Stepper(mlmodel, mlmodel.make_state()).prefill([1, 2, 3, 4, 5, 6])
+    assert np.abs(whole[0, 0, :] - dec2[0, 0, :]).max() < 0.05, \
         "连续 decode 与整段 prefill 的末位 logits 不一致，state 推进有误"
-    # 空 state 的同输入 decode 必须与有 cache 时不同
-    empty = predict(mlmodel, mlmodel.make_state(), [[5]], [4])
+    # 空 state 下同位置同 token 的输出必须与有历史时不同
+    empty = _Stepper(mlmodel, mlmodel.make_state())(5, 4)
     assert np.abs(dec1 - empty).max() > 1e-3, "空 state 的 decode 与有 cache 时相同"
 
 
@@ -546,12 +599,17 @@ def test_qwen35_coreml_numeric_parity_with_torch(tmp_path):
     with torch.no_grad():
         ref = {}
         wrapper.reset_state()
-        ref["prefill8"] = wrapper(ids, torch.arange(8)).numpy()
+        per_pos = [wrapper.step(ids[:, i:i + 1], torch.tensor([i]))
+                   for i in range(8)]
+        ref["prefill8"] = torch.cat(per_pos, dim=1).numpy()
         for i in range(8):
-            ref[f"dec{i}"] = wrapper(dec_ids[i].view(1, 1),
+            ref[f"dec{i}"] = wrapper.step(dec_ids[i].view(1, 1),
                                      torch.tensor([8 + i])).numpy()
         wrapper.reset_state()  # 对应 Core ML 侧换全新 state
-        ref["prefill12"] = wrapper(long_ids, torch.arange(12)).numpy()
+        wrapper.reset_state()
+        ref["prefill12"] = torch.cat(
+            [wrapper.step(long_ids[:, i:i + 1], torch.tensor([i]))
+             for i in range(12)], dim=1).numpy()
         # 参考输出形状必须与模型输入声明一致，避免"batch 维被当成序列维"的静默错误
         assert ref["prefill8"].shape == (1, 8, 128)
         assert ref["prefill12"].shape == (1, 12, 128)
@@ -578,11 +636,15 @@ def test_qwen35_coreml_numeric_parity_with_torch(tmp_path):
                               state)
             return np.asarray(o["logits"], dtype=np.float32)
 
-        outs = {"prefill8": predict(ids.numpy(), np.arange(8))}
+        # 单步模型：逐 token 推进，把各位置的 logits 拼回 (1, q, vocab)
+        stepper = _Stepper(model)
+        outs = {"prefill8": np.concatenate(
+            [stepper(int(ids[0, i]), i) for i in range(8)], axis=1)}
         for i in range(8):
-            outs[f"dec{i}"] = predict(dec_ids[i].view(1, 1).numpy(), [8 + i])
-        state = model.make_state()  # 全新 state：与 torch 侧 reset_state 对应
-        outs["prefill12"] = predict(long_ids.numpy(), np.arange(12))
+            outs[f"dec{i}"] = stepper(int(dec_ids[i]), 8 + i)
+        fresh = _Stepper(model, model.make_state())  # 全新 state：对应 reset_state
+        outs["prefill12"] = np.concatenate(
+            [fresh(int(long_ids[0, i]), i) for i in range(12)], axis=1)
         return outs
 
     def _metrics(r, g):
@@ -659,9 +721,11 @@ def test_llama_coreml_numeric_parity_with_torch(tmp_path):
     with torch.no_grad():
         ref = {}
         wrapper.reset_state()
-        ref["prefill5"] = wrapper(ids, torch.arange(5)).numpy()
+        ref["prefill5"] = torch.cat(
+            [wrapper.step(ids[:, i:i + 1], torch.tensor([i]))
+             for i in range(5)], dim=1).numpy()
         for i in range(6):
-            ref[f"dec{i}"] = wrapper(dec_ids[i].view(1, 1),
+            ref[f"dec{i}"] = wrapper.step(dec_ids[i].view(1, 1),
                                      torch.tensor([5 + i])).numpy()
 
     def _convert(nbits, out_name):
@@ -683,9 +747,11 @@ def test_llama_coreml_numeric_parity_with_torch(tmp_path):
                               state)
             return np.asarray(o["logits"], dtype=np.float32)
 
-        outs = {"prefill5": predict(ids.numpy(), np.arange(5))}
+        stepper = _Stepper(model)
+        outs = {"prefill5": np.concatenate(
+            [stepper(int(ids[0, i]), i) for i in range(5)], axis=1)}
         for i in range(6):
-            outs[f"dec{i}"] = predict(dec_ids[i].view(1, 1).numpy(), [5 + i])
+            outs[f"dec{i}"] = stepper(int(dec_ids[i]), 5 + i)
         return outs
 
     fp16_out = _convert(None, "out-fp16")
@@ -730,7 +796,10 @@ def _convert_assertions_only(out_path):
     import coremltools as ct
 
     spec = ct.utils.load_spec(str(out_path))
-    assert [i.name for i in spec.description.input] == ["input_ids", "cache_position"]
+    names = [i.name for i in spec.description.input]
+    assert names[:2] == ["input_ids", "cache_position"]
+    # 混合架构（含 linear attention 层）额外带 GDN 的 conv/rec 状态输入
+    assert set(names[2:]) <= {"conv_states", "recurrent_states"}, names
     assert spec.description.output, "应有输出"
     assert spec.description.output[0].name == "logits", "输出应重命名为 logits"
     assert spec.description.metadata.shortDescription, "应写入模型元数据"

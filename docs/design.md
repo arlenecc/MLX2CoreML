@@ -57,10 +57,11 @@ Python 包与命令行名为 `modconv`，macOS 应用与仓库名为 **MLX2CoreM
    融合内核用 `torch.histc` 统计每张专家的 token 数，coremltools 前端不支持该算子；
    量化模型的反量化中间产物写在**输出目录旁**（而非系统临时目录），避免数十 GB
    中间文件撑爆启动盘；
-3. **torch.export**：`KvCacheWrapper` 包装后以动态维度导出（详见 §4）。
-   `max_seq_len == 1` 时 `Dim(min=1, max=1)` 非法，退化为静态形状导出；
+3. **torch.export**：`KvCacheWrapper` 包装为**单步 decode** 后导出（详见 §4）：
+   图每次只推进一个 token，形状全静态（input_ids `(1,1)`、cache_position `(1,)`）；
 4. **coremltools 转换**：`convert_to="mlprogram"`，`minimum_deployment_target=iOS18`，
-   `compute_precision=FLOAT16`，`states=` 每层 K/V（及 GDN 的 conv/rec）的 `StateType`。
+   `compute_precision=FLOAT16`，`states=` **只一个** `StateType`（合并的 KV 缓存）。
+   混合架构的 GDN conv/rec 状态走普通的输入/输出张量（理由见 §4）；
    转换完成后立即 `del` torch 侧大对象（model/exported/wrapper）并 `gc.collect()`，
    降低量化与保存阶段的峰值内存；
 5. **后处理与保存**：4-bit palettization（`OpPalettizerConfig(nbits=4, mode="kmeans")`，
@@ -76,6 +77,13 @@ Python 包与命令行名为 `modconv`，macOS 应用与仓库名为 **MLX2CoreM
 | 转换（单独编译） | 通过 | 通过 | 通过 | — |
 | 4-bit 量化后 | -14 | -14 | -14 | **通过** |
 | 未量化 | 通过 | — | — | — |
+
+> 上表是**旧设计**（静态 `max_seq_len` 大图 + 3 个 StateType）下的实测。改为单步
+> decode 图后算子数下降两个数量级（tiny 模型转换 5.4 秒 vs 旧版 2 分钟），-14 是否
+> 仍然出现待重测（降级机制保留作为兜底）。另需注意：另两种量化粒度也会被 ANE 拒——
+> `OpPalettizerConfig` 只接受 `per_tensor` / `per_grouped_channel`，而 `per_block`
+> 粒度的线性量化（int4/int8）实测同样 -14（参考 `ref/CoreML-LLM` 的记录：ANE 不支持
+> per-(row,block) 的独立 LUT/scale）。
 
 即：**4-bit palettization 才是主导因素**（量化后的图在 512/256/128 都构建不了计划，
 未量化时这些长度都能过；fp16 加载把权重内存减半也救不了量化场景）。因此"追踪 →
@@ -174,13 +182,37 @@ MLX 生态的 checkpoint 未必是 transformers 能直接加载的布局，两�
   替换为静态批量前向：把 (token, top-k 槽位) 展平成 S = T×k 行 → 按 expert id
   gather 权重 → batched matmul → reshape 回 (T, k, H) 求和。与原版逐专家累加
   **逐位等价**（未选中专家的路由权重恒为 0），且只对 top-k 命中的专家计算。
-- **混合架构先切 hidden 再算 lm_head**：pad 到 `max_seq_len` 只为静态化 GDN 分块
-  循环，输出只取前 q 个位置。若先算 `(1, max_seq_len, vocab)` 再切片，会为 pad
-  位置也算一整份 logits（词表 248320、长度 512 时 fp32 下 508MB），是全图最大的
-  中间结果，既浪费算力也容易让 ANE 执行计划构建失败（-14）。`lm_head` 逐位置独立，
-  改为先切 hidden（`H` 维而非词表维）再算 logits，与原实现**数值等价**。
+- **GDN 单步 decode 前向（取代分块内核）**：原实现把输入 pad 到静态
+  `max_seq_len` 后走 `chunk_gated_delta_rule`——该内核要构造 (chunk, chunk) 的衰减
+  矩阵（`cumsum` → pairwise `exp` → 63 步 Neumann 迭代求解三角系统）。实测问题：
+  - **精度**：真实模型 `g` 每步可达 -13.8，64 步后 cumsum 到 -373，fp16 的 ulp 已
+    是 0.25 → 衰减系数相对误差 30-65%；而 `compute_precision=FLOAT16` 会抹掉内核里
+    显式的 `.to(float32)`，误差无法收敛（fp16 权重 + fp32 内核实测 cos 仅 0.41）；
+  - **规模**：整段 unroll 后全图 3.4 万算子（tiny 模型 5.4 秒 → 真实模型 30 分钟），
+    是 ANE 执行计划构建失败（-14）与预测期 ANE 编译卡死的主因。
+
+  单步下 delta rule 退化为一次秩一更新（与 `ref/CoreML-LLM` 的
+  `MLKVLinearAttnDecodeStep` 同构）：
+
+      rec    = rec * exp(g)              # 衰减
+      kv_mem = (rec * k).sum(-2)         # 读记忆
+      delta  = (v - kv_mem) * beta       # delta 修正
+      rec    = rec + k ⊗ delta           # 秩一更新
+      out    = (rec * q).sum(-2)         # 读出
+
+  没有 cumsum、没有 pairwise 矩阵、没有三角求解：fp16 下数值良态，算子数每层从
+  数百降到十余个。已验证逐步 prefill 与 HF 原生整段 prefill **逐位一致**
+  （cos=1.000000，差 ~6e-8）。prefill 因此改为**循环调用同一张 decode 图**
+  （recurrent prefill），不再需要独立的大 prefill 图。
+- **GDN 状态走图 I/O（只留一个 MLState）**：conv/rec 原本也做成 `ct.StateType`
+  （与 KV 一起共 3 个）。`ref/CoreML-LLM` 在同架构上的实测：每个 chunk 超过 1~2 个
+  StateType 时，Core ML 的 **CPU runtime 会误编译 slice_update**（输出 garbage/NaN），
+  ANE 侧 predict 期报 Error 11。这正好解释了本工具"转换成功、CPU 预测全 NaN"的现象
+  （max_seq 64/128/512 均复现，且与 chunk 数无关）。改为只把最大的 KV 缓存放进
+  MLState，conv/rec 作为图的输入/输出张量逐步传递（`new_conv_states` /
+  `new_recurrent_states`，Swift 侧字典持有）。
 - **导出要点**：
-  - 示例长度 ≥2（`min(max_seq_len, 4)`）：torch.export 会把尺寸为 1 的维度特化为常量；
+  - 单步输入形状全静态（无动态维度声明，也就没有 `Dim(min=1,max=1)` 的边界情况）；
   - 导出包在 `torch.no_grad()`：参数 requires_grad 时 buffer 的 in-place 变异会被
     aot_export 拒绝；
   - 分解表去掉 `aten.matmul` 分解并保留 `alias` 恒等：matmul 分解产生以 sym_size

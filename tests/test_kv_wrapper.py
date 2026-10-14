@@ -62,14 +62,13 @@ def test_prefill_and_decode_parity_with_hf():
             pos += 1
 
     wrapper = KvCacheWrapper(model, MAX_SEQ)
+    wrapper.reset_state()
     with torch.no_grad():
-        got = [wrapper(ids, torch.arange(5))]
-        pos = 5
-        for step_ids in steps:
-            got.append(wrapper(step_ids.reshape(1, 1), torch.tensor([pos])))
-            pos += 1
+        got = _recurrent_prefill_and_steps(wrapper, ids, steps)
 
     for i, (r, g) in enumerate(zip(ref, got)):
+        if i == 0:  # prefill：wrapper 逐步推进，只比对最后一个位置
+            r = r[:, -1:, :]
         assert torch.allclose(r, g, atol=1e-4), \
             f"第 {i} 步 logits 不一致（最大误差 {(r - g).abs().max().item()}）"
 
@@ -113,21 +112,40 @@ def _tiny_qwen35_model():
     return Qwen3_5ForCausalLM(_tiny_qwen35_config()).eval()
 
 
+def _recurrent_prefill_and_steps(wrapper, ids, steps):
+    """wrapper 逐步推进：prefill 逐 token 走同一张 decode 图（recurrent prefill），
+    返回 [prefill 最后一步 logits, 各 decode 步 logits]。"""
+    import torch
+    logits = None
+    for i in range(ids.shape[1]):
+        logits = wrapper.step(ids[:, i:i + 1], torch.tensor([i]))
+    out = [logits]
+    pos = ids.shape[1]
+    for step_ids in steps:
+        out.append(wrapper.step(step_ids.reshape(1, 1), torch.tensor([pos])))
+        pos += 1
+    return out
+
+
 def test_qwen35_hybrid_state_specs():
-    """混合架构同样合并 state：full 层 K/V 一个、GDN 层 conv/rec 各一个。"""
+    """MLState 只留 KV；GDN 的 conv/rec 走图 I/O（多 StateType 会触发 Core ML 的
+    slice_update 误编译——见 KvCacheWrapper.gdn_state_specs 的说明）。"""
     from modconv.kv_wrapper import KvCacheWrapper
     wrapper = KvCacheWrapper(_tiny_qwen35_model(), MAX_SEQ)
     specs = wrapper.kv_state_specs()
     names = [name for name, _, _ in specs]
-    assert names == ["kv_all", "conv_all", "rec_all"]
+    assert names == ["kv_all"]
     shapes = {name: tuple(shape) for name, shape, _ in specs}
     # 4 层里 2 层 full attention（层 1/3）→ kv_all 第 0 维为 2
     assert shapes["kv_all"] == (2, 2, 2, MAX_SEQ, 8)
-    # 2 层 GDN（层 0/2）→ conv/rec 的第 0 维为 2；conv 末维是卷积核大小
-    assert shapes["conv_all"][0] == 2 and len(shapes["conv_all"]) == 3
-    assert shapes["rec_all"][0] == 2
     for _, _, dtype in specs:
         assert dtype == "float16"
+    # GDN 状态：2 层（层 0/2）的 conv/rec，作为图的输入/输出张量
+    gdn = wrapper.gdn_state_specs()
+    assert [name for name, _, _ in gdn] == ["conv_states", "recurrent_states"]
+    gshapes = {name: tuple(shape) for name, shape, _ in gdn}
+    assert gshapes["conv_states"][0] == 2 and len(gshapes["conv_states"]) == 3
+    assert gshapes["recurrent_states"][0] == 2
     assert wrapper.state_buffers()
 
 
@@ -154,14 +172,13 @@ def test_qwen35_hybrid_prefill_decode_parity_with_hf():
             pos += 1
 
     wrapper = KvCacheWrapper(model, MAX_SEQ)
+    wrapper.reset_state()
     with torch.no_grad():
-        got = [wrapper(ids, torch.arange(5))]
-        pos = 5
-        for step_ids in steps:
-            got.append(wrapper(step_ids.reshape(1, 1), torch.tensor([pos])))
-            pos += 1
+        got = _recurrent_prefill_and_steps(wrapper, ids, steps)
 
     for i, (r, g) in enumerate(zip(ref, got)):
+        if i == 0:  # prefill：wrapper 逐步推进，只比对最后一个位置
+            r = r[:, -1:, :]
         assert torch.allclose(r, g, atol=1e-4), \
             f"第 {i} 步 logits 不一致（最大误差 {(r - g).abs().max().item()}）"
 
@@ -210,14 +227,13 @@ def test_qwen35_moe_prefill_decode_parity_with_hf():
             pos += 1
 
     wrapper = KvCacheWrapper(model, MAX_SEQ)
+    wrapper.reset_state()
     with torch.no_grad():
-        got = [wrapper(ids, torch.arange(5))]
-        pos = 5
-        for step_ids in steps:
-            got.append(wrapper(step_ids.reshape(1, 1), torch.tensor([pos])))
-            pos += 1
+        got = _recurrent_prefill_and_steps(wrapper, ids, steps)
 
     for i, (r, g) in enumerate(zip(ref, got)):
+        if i == 0:  # prefill：wrapper 逐步推进，只比对最后一个位置
+            r = r[:, -1:, :]
         assert torch.allclose(r, g, atol=1e-4), \
             f"第 {i} 步 logits 不一致（最大误差 {(r - g).abs().max().item()}）"
 

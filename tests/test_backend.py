@@ -49,6 +49,10 @@ class _StubKVWrapper(_StubModule):
         return [("cache_0_k", shape, "float32"), ("cache_0_v", shape, "float32"),
                 ("cache_1_k", shape, "float32"), ("cache_1_v", shape, "float32")]
 
+    def gdn_state_specs(self):
+        """混合架构的 conv/rec 状态（该桩模型是纯注意力架构，故为空）。"""
+        return []
+
     def state_buffers(self):
         return []
 
@@ -108,6 +112,7 @@ def _stub_libs():
         float16="float16",
         long="long",
         ones=lambda shape, dtype=None: ("ones", tuple(shape), dtype),
+        zeros=lambda shape, dtype=None: ("zeros", tuple(shape), dtype),
         arange=lambda n, **kw: ("arange", n),
         nn=types.SimpleNamespace(Module=_StubModule),
         export=types.SimpleNamespace(
@@ -595,6 +600,9 @@ def test_run_retries_with_shorter_context_when_ane_fails(tmp_path, monkeypatch):
         def kv_state_specs(self):
             return [("cache_0_k", (1, 2, self.max_seq_len, 4), "float32")]
 
+        def gdn_state_specs(self):
+            return []
+
     monkeypatch.setattr(real_backend_mod, "_build_kv_wrapper",
                         lambda model, max_seq: _SeqWrapper(model, max_seq))
     hooks = RecordingHooks()
@@ -603,7 +611,7 @@ def test_run_retries_with_shorter_context_when_ane_fails(tmp_path, monkeypatch):
     assert tried == [512, 256], tried
     assert any("降到 256" in m for m in hooks.logs), hooks.logs
     # 最终模型说明里的长度必须是真正生效的那个
-    assert "1..256" in result.message, result.message
+    assert "最大上下文 256" in result.message, result.message
 
 
 def test_run_falls_back_to_unquantized_when_quantized_model_cannot_build_plan(
@@ -652,6 +660,9 @@ def test_run_falls_back_to_unquantized_when_quantized_model_cannot_build_plan(
 
         def kv_state_specs(self):
             return [("cache_0_k", (1, 2, self.max_seq_len, 4), "float32")]
+
+        def gdn_state_specs(self):
+            return []
 
     monkeypatch.setattr(real_backend_mod, "_build_kv_wrapper",
                         lambda model, max_seq: _SeqWrapper(model, max_seq))
@@ -731,13 +742,15 @@ def test_real_backend_full_flow_stateful_mlprogram(tmp_path, monkeypatch):
     assert "coremltools" in result.message
     assert "KV cache" in result.message
 
-    # 动态长度输入：input_ids (1, 1..8)
+    # 单步 decode：input_ids (1, 1)、cache_position (1,)，形状全静态
     assert convert_kwargs["convert_to"] == "mlprogram"
     assert convert_kwargs["minimum_deployment_target"] == "ios18"
     inputs = convert_kwargs["inputs"]
     assert [i["name"] for i in inputs] == ["input_ids", "cache_position"]
-    assert inputs[0]["shape"] == (1, {"default": 1, "upper_bound": 8})
+    assert inputs[0]["shape"] == (1, 1)
     assert inputs[0]["dtype"] == "int32"
+    assert inputs[1]["shape"] == (1,)
+    assert inputs[1]["dtype"] == "int32"
     # KV cache states：数量 = 层数 × 2
     states = convert_kwargs["states"]
     assert [s["name"] for s in states] == [

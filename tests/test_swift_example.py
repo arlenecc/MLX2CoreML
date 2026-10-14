@@ -53,9 +53,10 @@ def test_swift_example_typechecks_without_warnings(tmp_path):
     from modconv.real_backend import _SWIFT_EXAMPLE_TEMPLATE
 
     src = tmp_path / "main.swift"
-    src.write_text(_SWIFT_EXAMPLE_TEMPLATE.format(model_name="m", max_seq_len=512,
-                                                  output_name="logits"),
-                   encoding="utf-8")
+    src.write_text(_SWIFT_EXAMPLE_TEMPLATE.format(
+        model_name="m", max_seq_len=512, max_seq_len_minus_1=511,
+        output_name="logits", gdn_state_swift_literal="[:]"),
+        encoding="utf-8")
     proc = subprocess.run(cmd + ["-typecheck", str(src)],
                           capture_output=True, text=True, timeout=600)
     assert proc.returncode == 0, f"Swift 示例编译失败:\n{proc.stderr}"
@@ -109,12 +110,15 @@ def test_swift_example_runs_and_matches_python(tmp_path):
     mlmodel = ct.models.MLModel(str(result.output_path), compute_units=ct.ComputeUnit.ALL)
     state = mlmodel.make_state()
 
-    def predict(ids, pos):
-        o = mlmodel.predict({"input_ids": np.array(ids, dtype=np.int32),
-                             "cache_position": np.array(pos, dtype=np.int32)}, state)
+    def predict(token, pos):
+        o = mlmodel.predict({"input_ids": np.array([[token]], dtype=np.int32),
+                             "cache_position": np.array([pos], dtype=np.int32)}, state)
         return np.asarray(o["logits"], dtype=np.float32)
 
-    logits = predict([[1, 2, 3, 4]], np.arange(4))
+    # 单步 decode 模型：prefill 逐 token 推进（recurrent prefill）
+    logits = None
+    for i, tok in enumerate([1, 2, 3, 4]):
+        logits = predict(tok, i)
     assert np.isfinite(logits).all()
     py_tokens = []
     position = 4
@@ -122,7 +126,7 @@ def test_swift_example_runs_and_matches_python(tmp_path):
         py_tokens.append(int(logits[0, -1].argmax()))
         if position >= 16:
             break
-        logits = predict([[py_tokens[-1]]], [position])
+        logits = predict(py_tokens[-1], position)
         position += 1
 
     assert swift_tokens == py_tokens, (
