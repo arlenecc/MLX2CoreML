@@ -118,13 +118,22 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.output_browse_btn, 1, 2)
 
         grid.addWidget(QLabel("最大上下文长度:"), 2, 0)
-        self.max_seq_edit = QLineEdit()
-        self.max_seq_edit.setPlaceholderText("留空 = 自动选取（正整数，单位 token）")
-        self.max_seq_edit.setToolTip(
+        # 预设下拉：自动 + 2k~256k；可编辑以便输入自定义整数（如 4096）。
+        # 索引与 _MAX_SEQ_PRESETS 绑定，解析见 _max_seq_len_from_input。
+        self.max_seq_combo = QComboBox()
+        self.max_seq_combo.setEditable(True)
+        self._MAX_SEQ_PRESETS = [
+            ("自动（≤512）", None), ("2k", 2048), ("4k", 4096), ("8k", 8192),
+            ("16k", 16384), ("32k", 32768), ("64k", 65536),
+            ("128k", 131072), ("256k", 262144),
+        ]
+        self.max_seq_combo.addItems([label for label, _ in self._MAX_SEQ_PRESETS])
+        self.max_seq_combo.setCurrentIndex(3)  # 默认 8k
+        self.max_seq_combo.setToolTip(
             "转换输出的最大上下文长度（token 数）。\n"
-            "留空时自动选取：取模型位置编码上限与 512 中的较小值；\n"
-            "输入超过模型位置编码上限时会被自动截断。")
-        grid.addWidget(self.max_seq_edit, 2, 1)
+            "可选预设档位，也可直接输入自定义整数（如 4096）或带 k 后缀（如 8k）；\n"
+            "选「自动」时取 min(模型位置编码上限, 512)；输入超过模型上限会被截断。")
+        grid.addWidget(self.max_seq_combo, 2, 1)
 
         # 权重压缩：n-bit palettization 减小体积、加速端侧推理。
         # 4-bit 体积最小（≈fp16 的 1/4～1/8），8-bit 精度最稳但体积大；
@@ -387,17 +396,27 @@ class MainWindow(QMainWindow):
         self._log(message)
 
     def _max_seq_len_from_input(self) -> int | None:
-        """解析最大上下文长度输入；留空 = 自动（None），非法/非正数提示后返回 None。"""
-        text = self.max_seq_edit.text().strip()
-        if not text:
+        """解析最大上下文长度：预设档位 / 自定义整数（支持 k、m 后缀）。
+
+        返回 None 表示自动（空或「自动」项）；正整数表示自定义；
+        非法输入弹窗提示并返回哨兵 -1，调用方据此拦截启动。
+        """
+        text = self.max_seq_combo.currentText().strip()
+        if not text or "自动" in text:
             return None
+        mult, low = 1, text.lower()
+        if low.endswith("k"):
+            mult, text = 1024, text[:-1]
+        elif low.endswith("m"):
+            mult, text = 1024 * 1024, text[:-1]
         try:
-            value = int(text)
+            value = int(text) * mult
         except ValueError:
             value = 0
         if value <= 0:
-            self._reject_start(f"最大上下文长度无效: {text}（应为正整数，留空自动）")
-            return None
+            self._reject_start(
+                f"最大上下文长度无效: {text}（应为正整数/预设档位，留空或选「自动」为自动）")
+            return -1
         return value
 
     @staticmethod
@@ -423,9 +442,9 @@ class MainWindow(QMainWindow):
     def _begin_conversion(self):
         if self._scan_result is None or self._conv_worker is not None or self._conv_workers:
             return
-        # 最大上下文长度：留空 = 自动；非法输入直接拦截（提示已在解析时给出）
+        # 最大上下文长度：None = 自动；-1 = 非法（已在解析时弹窗），直接拦截
         max_seq_len = self._max_seq_len_from_input()
-        if self.max_seq_edit.text().strip() and max_seq_len is None:
+        if max_seq_len == -1:
             return
         source = self._scan_result.source
         # 扫描期间输出目录输入框是可编辑的，由 _pending_start 触发时必须重新校验：
@@ -510,7 +529,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
 
     def _set_running(self, running: bool):
-        for widget in (self.source_edit, self.output_edit, self.max_seq_edit,
+        for widget in (self.source_edit, self.output_edit, self.max_seq_combo,
                        self.quant_combo, self.source_browse_btn,
                        self.output_browse_btn, self.start_button):
             widget.setEnabled(not running)

@@ -121,30 +121,37 @@ def test_pending_start_revalidates_output(qtbot, window, model_dir):
 # --------------------------------------------------------------------- #
 
 def test_max_seq_len_input_defaults_and_parsing(qtbot, window):
-    """默认留空（自动）；正整数生效；非法/非正数提示且返回 None。"""
-    assert window.max_seq_edit is not None
-    assert window.max_seq_edit.text() == ""
+    """默认 8k；预设档位与自定义整数（含 k 后缀）生效；非法输入弹窗并返回 -1。"""
+    assert window.max_seq_combo is not None
+    assert window.max_seq_combo.currentText() == "8k"
+    assert window._max_seq_len_from_input() == 8192
 
-    window.max_seq_edit.setText("1024")
+    # 预设档位
+    window.max_seq_combo.setCurrentText("32k")
+    assert window._max_seq_len_from_input() == 32768
+    window.max_seq_combo.setCurrentText("自动（≤512）")
+    assert window._max_seq_len_from_input() is None  # 自动
+
+    # 自定义整数 / k 后缀
+    window.max_seq_combo.setCurrentText("1024")
     assert window._max_seq_len_from_input() == 1024
-    window.max_seq_edit.setText(" 512 ")
+    window.max_seq_combo.setCurrentText(" 512 ")
     assert window._max_seq_len_from_input() == 512
+    window.max_seq_combo.setCurrentText("4k")
+    assert window._max_seq_len_from_input() == 4096
 
-    window.max_seq_edit.setText("abc")
-    assert window._max_seq_len_from_input() is None
+    # 非法输入：弹窗提示并返回哨兵 -1
+    window.max_seq_combo.setCurrentText("abc")
+    assert window._max_seq_len_from_input() == -1
     assert "无效" in window.status_label.text()
-
-    window.max_seq_edit.setText("-3")
-    assert window._max_seq_len_from_input() is None
-
-    window.max_seq_edit.setText("")
-    assert window._max_seq_len_from_input() is None  # 空 = 自动
+    window.max_seq_combo.setCurrentText("-3")
+    assert window._max_seq_len_from_input() == -1
 
 
 def test_start_blocked_by_invalid_max_seq(qtbot, window, model_dir, tmp_path):
     _prepare_scan(qtbot, window, model_dir)
     window.output_edit.setText(str(tmp_path / "out"))
-    window.max_seq_edit.setText("abc")
+    window.max_seq_combo.setCurrentText("abc")
     window.start_button.click()
     qtbot.wait(100)
     assert window._conv_worker is None
@@ -163,7 +170,7 @@ def test_start_passes_max_seq_len_to_worker(qtbot, window, model_dir, tmp_path, 
     monkeypatch.setattr("modconv.main_window.ConversionWorker", _spy_cls)
     _prepare_scan(qtbot, window, model_dir)
     window.output_edit.setText(str(tmp_path / "out"))
-    window.max_seq_edit.setText("256")
+    window.max_seq_combo.setCurrentText("256")
     window.start_button.click()
     qtbot.wait(100)
     assert captured.get("max_seq_len") == 256
@@ -246,12 +253,12 @@ def test_running_disables_quant_combo(window):
 # 健壮性与体验
 # --------------------------------------------------------------------- #
 
-def test_running_disables_max_seq_edit(window):
-    """转换运行中最大上下文长度输入应与其它配置一致被禁用。"""
+def test_running_disables_max_seq_combo(window):
+    """转换运行中最大上下文长度下拉应与其它配置一致被禁用。"""
     window._set_running(True)
-    assert not window.max_seq_edit.isEnabled()
+    assert not window.max_seq_combo.isEnabled()
     window._set_running(False)
-    assert window.max_seq_edit.isEnabled()
+    assert window.max_seq_combo.isEnabled()
 
 
 def test_stage_progress_status_text(window):
