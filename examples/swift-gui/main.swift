@@ -111,6 +111,106 @@ func argmaxFromLogits(_ logits: MLMultiArray, vocab: Int,
     return Int32(best)
 }
 
+// MARK: - 分词器常驻桥接
+/// 把 tok_helper.py 跑成常驻进程（--server）：启动一次、复用已加载的分词器，
+/// 避免原 runPython 每条消息都 spawn 新 Python + 重新加载分词器带来的固定延迟。
+final class TokenizerBridge {
+    static let shared = TokenizerBridge()
+
+    private var process: Process?
+    private var stdinHandle: FileHandle?
+    private var stdoutHandle: FileHandle?
+    private let queue = DispatchQueue(label: "modconv.tokbridge")
+    private var tokenizerURL: URL?
+    private var launchedWith: URL?
+
+    /// 设置分词器路径；若与已启动进程所用的不同，则下次请求时重建进程。
+    func configure(tokenizer: URL?) {
+        tokenizerURL = tokenizer
+        if let t = tokenizer, t != launchedWith { process = nil }
+    }
+
+    private func ensureStarted() throws {
+        if let p = process, p.isRunning { return }
+        process = nil
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: PYTHON)
+        p.arguments = [TOK_HELPER, "--server"]
+        if let tok = tokenizerURL {
+            var env = ProcessInfo.processInfo.environment
+            env["MODCONV_TOKENIZER"] = tok.path
+            p.environment = env
+        }
+        let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
+        p.standardInput = inPipe
+        p.standardOutput = outPipe
+        p.standardError = errPipe
+        try p.run()
+        process = p
+        stdinHandle = inPipe.fileHandleForWriting
+        stdoutHandle = outPipe.fileHandleForReading
+        launchedWith = tokenizerURL
+        DispatchQueue.global(qos: .utility).async {
+            let d = errPipe.fileHandleForReading.readDataToEndOfFile()
+            if let s = String(data: d, encoding: .utf8), !s.isEmpty {
+                NSLog("tok_helper stderr: \(s)")
+            }
+        }
+    }
+
+    /// 阻塞读取直到遇到一个换行符（常驻进程每行回一条响应）。
+    private func readLineBlocking() throws -> String {
+        guard let out = stdoutHandle else {
+            throw NSError(domain: "tok", code: 3, userInfo: [NSLocalizedDescriptionKey: "分词器未启动"])
+        }
+        var buf = Data()
+        while true {
+            let chunk = out.availableData
+            if chunk.isEmpty {
+                throw NSError(domain: "tok", code: 4, userInfo: [NSLocalizedDescriptionKey: "分词器进程已退出"])
+            }
+            buf.append(chunk)
+            if let last = buf.last, last == UInt8(ascii: "\n") { break }
+        }
+        buf.removeLast()
+        guard let s = String(data: buf, encoding: .utf8) else {
+            throw NSError(domain: "tok", code: 5, userInfo: [NSLocalizedDescriptionKey: "分词器返回非 UTF-8"])
+        }
+        return s
+    }
+
+    private func request(_ payload: [String: Any]) throws -> [String: Any] {
+        return try queue.sync {
+            try ensureStarted()
+            guard let stdin = stdinHandle else {
+                throw NSError(domain: "tok", code: 3, userInfo: [NSLocalizedDescriptionKey: "分词器未启动"])
+            }
+            let data = try JSONSerialization.data(withJSONObject: payload)
+            stdin.write(data)
+            stdin.write(Data([UInt8(ascii: "\n")]))
+            let resp = try readLineBlocking()
+            guard let obj = try JSONSerialization.jsonObject(with: Data(resp.utf8)) as? [String: Any] else {
+                throw NSError(domain: "tok", code: 6, userInfo: [NSLocalizedDescriptionKey: "分词器返回非法 JSON: \(resp)"])
+            }
+            if let err = obj["error"] as? String {
+                throw NSError(domain: "tok", code: 7, userInfo: [NSLocalizedDescriptionKey: "分词器错误: \(err)"])
+            }
+            return obj
+        }
+    }
+
+    func encode(_ text: String) throws -> [Int32] {
+        let obj = try request(["mode": "encode", "arg": text])
+        let data = (obj["data"] as? [Int]) ?? []
+        return data.map { Int32($0) }
+    }
+
+    func decode(_ ids: [Int32]) throws -> String {
+        let obj = try request(["mode": "decode", "arg": ids.map { Int($0) }])
+        return (obj["data"] as? String) ?? ""
+    }
+}
+
 // MARK: - 对话控制器
 struct ChatResult {
     let reply: String
@@ -401,33 +501,12 @@ final class ChatController: ObservableObject {
     }
 
     private func pyEncode(_ text: String) throws -> [Int32] {
-        let s = try runPython([TOK_HELPER, "encode", text])
-        let ids = try JSONDecoder().decode([Int].self, from: Data(s.utf8))
-        return ids.map { Int32($0) }
+        TokenizerBridge.shared.configure(tokenizer: selectedTokenizerURL)
+        return try TokenizerBridge.shared.encode(text)
     }
     private func pyDecode(_ ids: [Int32]) throws -> String {
-        let json = String(data: try JSONEncoder().encode(ids.map { Int($0) }), encoding: .utf8)!
-        return try runPython([TOK_HELPER, "decode", json])
-    }
-    private func runPython(_ args: [String]) throws -> String {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: PYTHON)
-        p.arguments = args
-        // 用户显式选了 tokenizer.json 时，通过环境变量传给 tok_helper.py；
-        // 否则不设置，沿用 tok_helper.py 自身的默认/环境变量。
-        if let tok = selectedTokenizerURL {
-            var env = ProcessInfo.processInfo.environment
-            env["MODCONV_TOKENIZER"] = tok.path
-            p.environment = env
-        }
-        let out = Pipe(), err = Pipe()
-        p.standardOutput = out; p.standardError = err
-        try p.run(); p.waitUntilExit()
-        if p.terminationStatus != 0 {
-            let e = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw NSError(domain: "tok", code: 1, userInfo: [NSLocalizedDescriptionKey: e])
-        }
-        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        TokenizerBridge.shared.configure(tokenizer: selectedTokenizerURL)
+        return try TokenizerBridge.shared.decode(ids)
     }
 }
 
