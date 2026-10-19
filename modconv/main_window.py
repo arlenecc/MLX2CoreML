@@ -101,25 +101,44 @@ class MainWindow(QMainWindow):
         grid = QGridLayout(panel)
         grid.setContentsMargins(12, 12, 12, 12)
 
-        grid.addWidget(QLabel("MLX 模型目录:"), 0, 0)
+        grid.addWidget(QLabel("模型目录:"), 0, 0)
         self.source_edit = QLineEdit()
-        self.source_edit.setPlaceholderText("选择包含 MLX 模型（config.json / *.safetensors）的目录")
+        self.source_edit.setPlaceholderText("选择模型目录（HF 模型或 ONNX 文件）")
         grid.addWidget(self.source_edit, 0, 1)
         self.source_browse_btn = QPushButton("浏览...")
         self.source_browse_btn.clicked.connect(self._browse_source)
         grid.addWidget(self.source_browse_btn, 0, 2)
+        self.onnx_browse_btn = QPushButton("选 ONNX 文件...")
+        self.onnx_browse_btn.clicked.connect(self._browse_onnx_source)
+        grid.addWidget(self.onnx_browse_btn, 0, 3)
+        self.gguf_browse_btn = QPushButton("选 GGUF 文件...")
+        self.gguf_browse_btn.clicked.connect(self._browse_gguf_source)
+        grid.addWidget(self.gguf_browse_btn, 0, 4)
 
-        grid.addWidget(QLabel("Core ML 输出目录:"), 1, 0)
+        grid.addWidget(QLabel("输出目录:"), 1, 0)
         self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("选择转换后 Core ML 模型的存放目录")
+        self.output_edit.setPlaceholderText("选择转换产物的存放目录")
         grid.addWidget(self.output_edit, 1, 1)
         self.output_browse_btn = QPushButton("浏览...")
         self.output_browse_btn.clicked.connect(self._browse_output)
         grid.addWidget(self.output_browse_btn, 1, 2)
 
-        grid.addWidget(QLabel("最大上下文长度:"), 2, 0)
-        # 预设下拉：自动 + 2k~256k；可编辑以便输入自定义整数（如 4096）。
-        # 索引与 _MAX_SEQ_PRESETS 绑定，解析见 _max_seq_len_from_input。
+        # 目标格式：决定走哪条转换链路（Core ML / ONNX / MLX / GGUF）
+        grid.addWidget(QLabel("目标格式:"), 2, 0)
+        self.target_combo = QComboBox()
+        self._TARGET_ITEMS = [("Core ML (.mlpackage)", "coreml"),
+                              ("ONNX (.onnx)", "onnx"),
+                              ("MLX (Apple)", "mlx"),
+                              ("GGUF (llama.cpp)", "gguf")]
+        for label, data in self._TARGET_ITEMS:
+            self.target_combo.addItem(label, data)
+        self.target_combo.setCurrentIndex(0)
+        self.target_combo.currentIndexChanged.connect(lambda _: self._on_target_changed())
+        grid.addWidget(self.target_combo, 2, 1)
+
+        # 最大上下文长度：仅 Core ML（带 KV cache 的 stateful 模型）需要
+        self.max_seq_label = QLabel("最大上下文长度:")
+        grid.addWidget(self.max_seq_label, 3, 0)
         self.max_seq_combo = QComboBox()
         self.max_seq_combo.setEditable(True)
         self._MAX_SEQ_PRESETS = [
@@ -128,32 +147,36 @@ class MainWindow(QMainWindow):
             ("128k", 131072), ("256k", 262144),
         ]
         self.max_seq_combo.addItems([label for label, _ in self._MAX_SEQ_PRESETS])
-        # 默认「自动（≤512）」：SEQ_LEN_CAP=512 是 ANE 能稳定构建执行计划的
-        # 上限，显式选更大值（8k/16k…）会生成 GB 级 KV buffer，且在 ANE 上大概率
-        # -14，从而触发一连串自动降级重试（每次都重做 ANE 编译，耗时极长）。未
-        # 指定时由后端按 min(位置编码上限, 512) 选取，是最稳妥的默认。
         self.max_seq_combo.setCurrentIndex(0)  # 默认「自动（≤512）」
         self.max_seq_combo.setToolTip(
-            "转换输出的最大上下文长度（token 数）。\n"
-            "可选预设档位，也可直接输入自定义整数（如 4096）或带 k 后缀（如 8k）；\n"
-            "选「自动」时取 min(模型位置编码上限, 512)；输入超过模型上限会被截断。")
-        grid.addWidget(self.max_seq_combo, 2, 1)
+            "转换输出的最大上下文长度（token 数），仅 Core ML 目标需要。\n"
+            "选「自动」时取 min(模型位置编码上限, 512)，最稳妥。")
+        grid.addWidget(self.max_seq_combo, 3, 1)
 
-        # 权重压缩：n-bit palettization 减小体积、加速端侧推理。
-        # 4-bit 体积最小（≈fp16 的 1/4～1/8），8-bit 精度最稳但体积大；
-        # fp16 为不压缩全精度。下拉顺序与 _QUANT_ITEMS 索引绑定。
+        # 权重压缩：选项随目标格式自适应（Core ML 用 n-bit；ONNX/MLX 用 int4/int8）
+        grid.addWidget(QLabel("权重压缩:"), 4, 0)
         self.quant_combo = QComboBox()
-        self._QUANT_ITEMS = [("fp16（不压缩）", None),
-                             ("4-bit", 4), ("6-bit", 6), ("8-bit", 8)]
-        self.quant_combo.addItems([label for label, _ in self._QUANT_ITEMS])
-        self.quant_combo.setCurrentIndex(1)  # 默认 4-bit
-        self.quant_combo.setToolTip(
-            "对输出权重做 n-bit palettization，减小体积、加速端侧推理。\n"
-            "4-bit 体积最小（≈fp16 的 1/4～1/8），8-bit 精度最稳但体积大；\n"
-            "少数架构量化后无法在 ANE 上运行，工具会自动改为未量化重转。")
+        self._QUANT_COREML = [("fp16（不压缩）", "fp16"),
+                              ("4-bit", "4bit"), ("6-bit", "6bit"), ("8-bit", "8bit")]
+        self._QUANT_ONNX_MLX = [("fp16（不压缩）", "fp16"),
+                                ("int8", "int8"), ("int4", "int4")]
         self.quant_combo.currentIndexChanged.connect(lambda _: self._refresh_estimate())
-        grid.addWidget(QLabel("权重压缩:"), 3, 0)
-        grid.addWidget(self.quant_combo, 3, 1)
+        grid.addWidget(self.quant_combo, 4, 1)
+
+        # 模型类型：仅 HF→ONNX 时需要（自动判定或手动指定）
+        self.kind_label = QLabel("模型类型 (HF→ONNX):")
+        grid.addWidget(self.kind_label, 5, 0)
+        self.kind_combo = QComboBox()
+        self._KIND_ITEMS = [("自动", "auto"), ("文本生成", "causal"),
+                            ("嵌入", "embedding"), ("重排序", "reranker")]
+        for label, data in self._KIND_ITEMS:
+            self.kind_combo.addItem(label, data)
+        self.kind_combo.setCurrentIndex(0)
+        grid.addWidget(self.kind_combo, 5, 1)
+
+        # 初始化目标相关的可选项与可用性
+        self._refresh_quant_options()
+        self._on_target_changed()
 
         # 手动输入路径后延迟触发扫描：连续敲键盘/多次回车会各起一次全目录扫描
         # （旧扫描无法取消，还会互相抢占），防抖后只保留最后一次
@@ -227,6 +250,22 @@ class MainWindow(QMainWindow):
             self.source_edit.setText(path)
             self._refresh_scan()
 
+    def _browse_onnx_source(self):
+        """选择单个 .onnx 文件作为源（GGUF/MLX 目标支持 ONNX 源）。"""
+        default = str(Path(self.source_edit.text() or Path.home()).parent)
+        path, _ = QFileDialog.getOpenFileName(self, "选择 ONNX 模型文件", default, "ONNX (*.onnx)")
+        if path:
+            self.source_edit.setText(path)
+            self._refresh_scan()
+
+    def _browse_gguf_source(self):
+        """选择单个 .gguf 文件作为源（MLX/ONNX 目标支持 GGUF 源）。"""
+        default = str(Path(self.source_edit.text() or Path.home()).parent)
+        path, _ = QFileDialog.getOpenFileName(self, "选择 GGUF 模型文件", default, "GGUF (*.gguf)")
+        if path:
+            self.source_edit.setText(path)
+            self._refresh_scan()
+
     def _browse_output(self):
         default = self.output_edit.text() or str(Path.home())
         path = _ask_existing_directory(self, "选择 Core ML 输出目录", default)
@@ -250,7 +289,7 @@ class MainWindow(QMainWindow):
             self._scan_result = None
             self._scan_source = None
             self._pending_start = False
-            self.source_stats_label.setText("MLX 模型目录: 未扫描")
+            self.source_stats_label.setText("源模型目录: 未扫描")
             self.estimate_stats_label.setText("预计 Core ML 输出: —")
             return
         path = Path(text).expanduser()
@@ -258,12 +297,12 @@ class MainWindow(QMainWindow):
             self._scan_result = None
             self._scan_source = None
             self._pending_start = False
-            self.source_stats_label.setText("MLX 模型目录: 无效路径")
+            self.source_stats_label.setText("源模型目录: 无效路径")
             self.estimate_stats_label.setText("预计 Core ML 输出: —")
             self._set_status(f"无效的模型目录: {path}")
             return
         gen = self._scan_gen
-        self.source_stats_label.setText("正在扫描 MLX 模型目录…")
+        self.source_stats_label.setText("正在扫描源模型目录…")
         worker = ScanWorker(path)
         worker.scan_progress.connect(lambda c, b, g=gen: self._on_scan_progress(g, c, b))
         worker.scan_finished.connect(lambda r, g=gen: self._on_scan_finished(g, r))
@@ -301,30 +340,62 @@ class MainWindow(QMainWindow):
         self._pending_start = False
         self.source_stats_label.setText(f"扫描失败: {message}")
 
-    def _selected_quantize_nbits(self) -> "int | None":
-        """从压缩下拉框解析要传给后端的权重 bit 数；fp16 项返回 None（不压缩）。"""
-        _, nbits = self._QUANT_ITEMS[self.quant_combo.currentIndex()]
-        return nbits
+    def _selected_quant_mode(self) -> str:
+        """当前压缩下拉框对应的量化档位字符串（fp16/4bit/6bit/8bit/int4/int8）。"""
+        return self.quant_combo.currentData()
+
+    def _refresh_quant_options(self):
+        """按目标格式刷新压缩下拉框可选项（Core ML 用 n-bit；ONNX/MLX 用 int4/int8）。"""
+        target = self.target_combo.currentData()
+        items = self._QUANT_COREML if target == "coreml" else self._QUANT_ONNX_MLX
+        self.quant_combo.blockSignals(True)
+        self.quant_combo.clear()
+        for label, mode in items:
+            self.quant_combo.addItem(label, mode)
+        # 默认：Core ML 选 4-bit（沿用历史默认）；ONNX/MLX 选 fp16（不压缩）
+        self.quant_combo.setCurrentIndex(1 if target == "coreml" else 0)
+        self.quant_combo.blockSignals(False)
+
+    def _on_target_changed(self):
+        target = self.target_combo.currentData()
+        self._refresh_quant_options()
+        coreml = target == "coreml"
+        self.max_seq_combo.setEnabled(coreml)
+        self.max_seq_label.setEnabled(coreml)
+        onnx = target == "onnx"
+        self.kind_combo.setEnabled(onnx)
+        self.kind_label.setEnabled(onnx)
+        self._refresh_estimate()
 
     def _refresh_estimate(self):
-        """按当前扫描结果 + 架构预判 + 压缩开关刷新体积预估。"""
+        """按当前扫描结果 + 目标格式 + 压缩档位刷新体积预估。"""
         scan = self._scan_result
         if scan is None:
             return
-        # 体积预估按实际后端口径计算：架构受支持「且」真实转换依赖齐备时走真实
-        # 转换，否则按打包 1:1。两者都只做轻量读取（config.json / find_spec），
-        # 不真正导入 torch/coremltools，避免界面卡顿。
-        model_type = detect_model_type(scan.source)
-        real_ok = model_type in SUPPORTED_MODEL_TYPES and real_backend_available()
-        backend = "coremltools" if real_ok else "package"
-        nbits = self._selected_quantize_nbits()
-        estimate = estimate_output(scan, backend=backend,
-                                   compressed=(nbits is not None), nbits=nbits)
-        note = ("（打包口径）" if backend == "package"
-                else f"（{nbits}-bit 压缩估算）" if nbits
-                else "（fp16 未压缩估算）")
+        target = self.target_combo.currentData()
+        mode = self._selected_quant_mode()
+        if target == "coreml":
+            # 体积预估按实际后端口径：架构受支持「且」真实转换依赖齐备时走真实
+            # 转换，否则按打包 1:1。只做轻量读取（config.json / find_spec）。
+            model_type = detect_model_type(scan.source)
+            real_ok = model_type in SUPPORTED_MODEL_TYPES and real_backend_available()
+            backend = "coremltools" if real_ok else "package"
+            nbits = {"fp16": None, "4bit": 4, "6bit": 6, "8bit": 8}.get(mode)
+            estimate = estimate_output(scan, backend=backend,
+                                       compressed=(nbits is not None), nbits=nbits)
+            note = ("（打包口径）" if backend == "package"
+                    else f"（{nbits}-bit 压缩估算）" if nbits
+                    else "（fp16 未压缩估算）")
+            label = "预计 Core ML 输出"
+        else:
+            backend = target  # "onnx" / "mlx" / "gguf"
+            estimate = estimate_output(scan, backend=backend,
+                                       compressed=(mode != "fp16"), nbits=mode)
+            note = "" if mode == "fp16" else f"（{mode} 量化估算）"
+            label = {"onnx": "预计 ONNX 输出", "mlx": "预计 MLX 输出",
+                     "gguf": "预计 GGUF 输出"}[target]
         self.estimate_stats_label.setText(
-            f"预计 Core ML 输出: ≈{estimate.file_count} 个文件, "
+            f"{label}: ≈{estimate.file_count} 个文件, "
             f"{format_size(estimate.total_bytes)}{note}")
 
     def _on_scan_finished(self, gen: int, result: ScanResult):
@@ -333,13 +404,15 @@ class MainWindow(QMainWindow):
         self._scan_result = result
         self._scan_source = result.source
         self.source_stats_label.setText(
-            f"MLX 模型目录: {result.count} 个文件, {format_size(result.total_bytes)}")
+            f"源模型目录: {result.count} 个文件, {format_size(result.total_bytes)}")
         self._refresh_estimate()
         # 不支持/无法识别的架构、或真实转换依赖缺失，都会在转换时才暴露
         # （转换失败，或静默退回打包产物），扫描阶段就提示，避免用户等半天才
         # 发现走了兜底路径
         model_type = detect_model_type(result.source)
-        if model_type not in SUPPORTED_MODEL_TYPES:
+        if model_type is None and result.source.is_file():
+            pass  # 单文件源（.onnx）：没有 config.json，跳过架构提示
+        elif model_type not in SUPPORTED_MODEL_TYPES:
             arch = model_type or "未识别（缺少或非法的 config.json）"
             hint = (f"架构 '{arch}' 暂不支持真实转换，将使用打包后端"
                     if model_type else f"{arch}，将使用打包后端")
@@ -381,11 +454,13 @@ class MainWindow(QMainWindow):
     def _source_path_from_input(self) -> Path | None:
         text = self.source_edit.text().strip()
         if not text:
-            self._reject_start("请先选择 MLX 模型目录")
+            self._reject_start("请先选择模型目录、.onnx 或 .gguf 文件")
             return None
         source = Path(text).expanduser()
-        if not source.is_dir():
-            self._reject_start(f"MLX 模型目录不存在: {source}")
+        # 目录（HF/MLX/ONNX）或单个 .onnx / .gguf 文件均可作为源
+        if not source.is_dir() and not (
+                source.is_file() and source.suffix.lower() in (".onnx", ".gguf")):
+            self._reject_start(f"模型目录或文件不存在: {source}")
             return None
         return source
 
@@ -468,9 +543,12 @@ class MainWindow(QMainWindow):
         self._set_running(True)
         self.progress_bar.setValue(0)
         self._log(f"开始转换: {source.name} → {output}")
+        target = self.target_combo.currentData()
+        quant_mode = self._selected_quant_mode()
+        model_kind = self.kind_combo.currentData() if target == "onnx" else "auto"
         worker = ConversionWorker(source, output, self._scan_result.files,
-                                  max_seq_len=max_seq_len,
-                                  quantize_nbits=self._selected_quantize_nbits())
+                                  target=target, max_seq_len=max_seq_len,
+                                  quant_mode=quant_mode, model_kind=model_kind)
         self._conv_worker = worker
         self._conv_workers.append(worker)
         worker.log_message.connect(self._log)
@@ -510,6 +588,15 @@ class MainWindow(QMainWindow):
         self._set_running(False)
         prefix = "✓ " if result.success else ("⏹ " if result.cancelled else "✗ ")
         self._log(prefix + result.message)
+        # 自动验证结果（转换完成后对产物做可用性/保真校验）
+        if result.success and result.verification is not None:
+            v = result.verification
+            if v.skipped:
+                self._log(f"  验证: 跳过（{v.summary}）")
+            elif v.passed:
+                self._log(f"  验证通过 ✓ {v.summary}")
+            else:
+                self._log(f"  验证未通过 ✗ {v.summary}")
         self._set_status(result.message)
         if result.success:
             self.progress_bar.setValue(100)

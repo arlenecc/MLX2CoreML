@@ -112,7 +112,8 @@ def test_worker_no_fallback_when_real_backend_fails(qtbot, model_dir, tmp_path, 
     """真实转换抛异常时直接报错——禁止自动降级回打包后端。"""
     monkeypatch.setattr(
         "modconv.workers.probe_backend",
-        lambda source, requested="auto": BackendPlan("coremltools", "test", model_type="llama"))
+        lambda source, requested="auto", target="coreml":
+            BackendPlan("coremltools", "test", model_type="llama", target=target))
     monkeypatch.setattr("modconv.workers.CoremltoolsBackend", _FailingBackend)
     out = tmp_path / "out"
     out.mkdir()
@@ -133,7 +134,8 @@ def test_worker_uses_real_backend_result(qtbot, model_dir, tmp_path, monkeypatch
     """真实转换成功时直接采用其结果，不再执行打包。"""
     monkeypatch.setattr(
         "modconv.workers.probe_backend",
-        lambda source, requested="auto": BackendPlan("coremltools", "test", model_type="llama"))
+        lambda source, requested="auto", target="coreml":
+            BackendPlan("coremltools", "test", model_type="llama", target=target))
     monkeypatch.setattr("modconv.workers.CoremltoolsBackend", _SuccessBackend)
     out = tmp_path / "out"
     out.mkdir()
@@ -196,7 +198,8 @@ def test_worker_passes_max_seq_len_to_real_backend(qtbot, model_dir, tmp_path, m
 
     monkeypatch.setattr(
         "modconv.workers.probe_backend",
-        lambda source, requested="auto": BackendPlan("coremltools", "test", model_type="llama"))
+        lambda source, requested="auto", target="coreml":
+            BackendPlan("coremltools", "test", model_type="llama", target=target))
     monkeypatch.setattr("modconv.workers.CoremltoolsBackend", _SpyBackend)
     out = tmp_path / "out"
     out.mkdir()

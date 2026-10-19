@@ -7,7 +7,7 @@ from typing import Sequence
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
-from modconv.backend import probe_backend
+from modconv.backend import BackendPlan, probe_backend
 from modconv.converter import ConversionResult, ModelConverter
 from modconv.real_backend import CoremltoolsBackend
 from modconv.scanner import FileInfo, scan_directory
@@ -88,16 +88,23 @@ class ConversionWorker(_TrackedThread):
     conversion_finished = pyqtSignal(object)             # ConversionResult
 
     def __init__(self, source: Path, output_dir: Path, files: Sequence[FileInfo],
-                 parent=None, backend: str = "auto", max_seq_len: int | None = None,
-                 quantize_nbits: int | None = 4, **kwargs):
+                 parent=None, backend: str = "auto", target: str = "coreml",
+                 max_seq_len: int | None = None,
+                 quantize_nbits: int | None = 4, quant_mode: str = "fp16",
+                 model_kind: str = "auto", **kwargs):
         super().__init__(parent)
         self._source = Path(source)
         self._output_dir = Path(output_dir)
         self._files = list(files)
         self._backend = backend
+        self._target = target
         self._max_seq_len = max_seq_len
-        # 权重压缩位数：只有真实转换后端用得到；打包后端忽略（原样 1:1 拷贝）
+        # 权重压缩位数：只有真实转换（Core ML）后端用得到；打包后端忽略
         self._quantize_nbits = quantize_nbits
+        # 量化模式（跨后端统一）：fp16 / int4 / int8（Core ML 另支持 4bit/6bit/8bit 调色板）
+        self._quant_mode = quant_mode
+        # HF→ONNX 的模型类型提示：auto / causal / embedding / reranker
+        self._model_kind = model_kind
         self._kwargs = kwargs
         self._cancelled = False
 
@@ -117,35 +124,92 @@ class ConversionWorker(_TrackedThread):
             if result is None:  # 理论上不可达：保证 UI 收到的永远是有效结果
                 result = ConversionResult(False, False, "转换失败: 未知错误",
                                           None, 0, 0, 0.0)
+            # 转换成功后自动验证产物可用性（打包后端无可推理产物，跳过）
+            if result.success and self._backend != "package" and result.output_path:
+                try:
+                    from modconv.verify import verify_conversion
+                    ver = verify_conversion(
+                        self._target, result.output_path, self._source, hooks,
+                        model_kind=self._model_kind, quant_mode=self._quant_mode)
+                    result = ConversionResult(
+                        result.success, result.cancelled, result.message,
+                        result.output_path, result.files_done, result.bytes_done,
+                        result.elapsed_seconds, verification=ver)
+                except Exception as exc:  # 验证异常不覆盖转换结果
+                    try:
+                        hooks.on_log(f"验证步骤异常（已忽略）: {type(exc).__name__}: {exc}")
+                    except Exception:
+                        pass
             if result.success:
                 self.overall_progress.emit(result.bytes_done, result.bytes_done)
             # conversion_finished 必须无条件发出：UI 靠它解除运行中状态
             self.conversion_finished.emit(result)
 
     def _run_backend(self, hooks) -> ConversionResult:
-        if self._backend != "package":
-            plan = probe_backend(self._source, requested=self._backend)
-            hooks.on_log(plan.describe())
-            if plan.name == "coremltools":
-                try:
-                    result = CoremltoolsBackend(self._source, self._output_dir,
-                                                max_seq_len=self._max_seq_len,
-                                                quantize_nbits=self._quantize_nbits).run(hooks)
-                except Exception as exc:
-                    # 真实转换失败直接报错，禁止降级回打包后端（打包产物不是
-                    # 可用的 Core ML 模型，静默回退会掩盖失败）。
-                    # 带上异常类型便于定位（Core ML 的错误常只带一个 dict 描述）
-                    message = f"coremltools 转换失败: {type(exc).__name__}: {exc}"
-                    hooks.on_log(message)
-                    result = ConversionResult(False, False, message, None, 0, 0, 0.0)
-                return result
+        # 强制打包：跳过探测，直接 1:1 拷贝（不可直接推理）
+        if self._backend == "package":
+            plan = BackendPlan("package", "用户指定打包后端", available=True)
+        else:
+            plan = probe_backend(self._source, requested=self._backend, target=self._target)
+        hooks.on_log(plan.describe())
+        if not plan.available:
+            # 依赖缺失 / 源-目标不匹配：明确报错，不静默降级为打包产物
+            return ConversionResult(False, False,
+                                   f"无法执行该转换: {plan.reason}", None, 0, 0, 0.0)
         try:
+            if plan.name == "coremltools":
+                # Core ML 的量化模式映射到 n-bit 调色板（palettization）
+                _QMODE_TO_NBITS = {"fp16": None, "4bit": 4, "6bit": 6, "8bit": 8}
+                nbits = _QMODE_TO_NBITS.get(self._quant_mode, self._quantize_nbits)
+                return CoremltoolsBackend(self._source, self._output_dir,
+                                          max_seq_len=self._max_seq_len,
+                                          quantize_nbits=nbits).run(hooks)
+            if plan.name == "onnx":
+                if plan.task == "onnx->onnx":
+                    from modconv.onnx_backend import OnnxToOnnxBackend
+                    return OnnxToOnnxBackend(self._source, self._output_dir,
+                                             quant_mode=self._quant_mode).run(hooks)
+                if plan.task == "mlx->onnx":
+                    from modconv.onnx_backend import MlxToOnnxBackend
+                    return MlxToOnnxBackend(self._source, self._output_dir,
+                                            quant_mode=self._quant_mode,
+                                            model_kind=self._model_kind).run(hooks)
+                if plan.task == "gguf->onnx":
+                    from modconv.onnx_backend import GgufToOnnxBackend
+                    return GgufToOnnxBackend(self._source, self._output_dir,
+                                            quant_mode=self._quant_mode).run(hooks)
+                from modconv.onnx_backend import HfToOnnxBackend
+                return HfToOnnxBackend(self._source, self._output_dir,
+                                       quant_mode=self._quant_mode,
+                                       model_kind=self._model_kind).run(hooks)
+            if plan.name == "mlx":
+                from modconv.mlx_backend import OnnxToMlxBackend
+                return OnnxToMlxBackend(self._source, self._output_dir,
+                                        quant_mode=self._quant_mode).run(hooks)
+            if plan.name == "mlx_rekey":
+                from modconv.mlx_rekey_backend import MlxToMlxBackend
+                return MlxToMlxBackend(self._source, self._output_dir,
+                                       quant_mode=self._quant_mode).run(hooks)
+            if plan.name == "mlx_libs":
+                if plan.task == "gguf->mlx":
+                    from modconv.gguf_to_mlx_backend import GgufToMlxBackend
+                    return GgufToMlxBackend(self._source, self._output_dir,
+                                            quant_mode=self._quant_mode).run(hooks)
+                from modconv.mlx_libs_backend import HfToMlxBackend
+                return HfToMlxBackend(self._source, self._output_dir,
+                                      quant_mode=self._quant_mode).run(hooks)
+            if plan.name == "gguf":
+                from modconv.gguf_backend import GgufBackend
+                return GgufBackend(self._source, self._output_dir,
+                                   quant_mode=self._quant_mode).run(hooks)
+            # 兜底：1:1 打包（不可直接推理）
             return ModelConverter(self._source, self._output_dir,
                                   self._files, **self._kwargs).run(hooks)
-        except Exception as exc:  # 转换器内部异常统一兜底，避免线程崩溃
-            return ConversionResult(False, False,
-                                    f"转换失败: {type(exc).__name__}: {exc}",
-                                    None, 0, 0, 0.0)
+        except Exception as exc:
+            # 真实转换失败直接报错（含 Core ML 那种只带 dict 描述的错误），禁止静默回退
+            message = f"转换失败: {type(exc).__name__}: {exc}"
+            hooks.on_log(message)
+            return ConversionResult(False, False, message, None, 0, 0, 0.0)
 
 
 class _WorkerHooks:

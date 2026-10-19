@@ -16,7 +16,12 @@ dev = ["pytest>=8", "pytest-qt>=4.4"]
 # run_decompositions(AOT 阶段) 会崩溃，导致转换全流程失败。
 convert = ["torch>=2.2,<2.8", "torchvision>=0.17,<0.23", "transformers>=4.44", "coremltools>=8.0", "safetensors>=0.4", "numpy",
            # MLX 量化模型反量化需要（仅 macOS）
-           "mlx-lm>=0.25; platform_system=='Darwin'"]
+           "mlx-lm>=0.25; platform_system=='Darwin'",
+           # 新增目标：ONNX / MLX(encoder) / MLX(vlm) / GGUF
+           "onnx>=1.14", "onnxruntime>=1.16",
+           "mlx-embeddings>=0.0.10; platform_system=='Darwin'",
+           "mlx-vlm>=0.1.0; platform_system=='Darwin'",
+           "gguf>=0.6"]
 
 [project.scripts]
 modconv = "modconv.app:main"

@@ -27,6 +27,9 @@ PALETTIZE_BYTES_FACTOR = 0.35
 # 之前统一用 0.35 会系统性偏低估真实体积。
 _PALETTIZE_PER_NBIT = {4: 0.35, 6: 0.42, 8: 0.5}
 
+# ONNX/MLX 量化相对 fp16 的体积系数（int8≈0.5、int4≈0.25，另含少量索引/LUT 开销）
+_ONNX_QUANT_FACTOR = {"int8": 0.5, "int4": 0.28}
+
 
 @dataclass(frozen=True)
 class OutputEstimate:
@@ -36,14 +39,27 @@ class OutputEstimate:
 
 def estimate_output(scan: ScanResult, *, backend: str = "package",
                     compressed: bool = True, nbits: Optional[int] = None) -> OutputEstimate:
-    """估算转换后 Core ML 输出的文件数量与总占用空间。
+    """估算转换后输出的文件数量与总占用空间。
 
-    backend="package"（默认）：打包口径——权重 1:1 无损存放，加上 Manifest.json
-    的开销。
+    backend="package"（默认）：打包口径——权重 1:1 无损存放，加上 Manifest.json 的开销。
     backend="coremltools"：真实转换口径——只把权重写进 .mlpackage，按 fp16（compressed
-    =False）或 fp16 + palettization 折算体积，辅助文件（config/tokenizer 等）不进模型。
-    nbits 指定压缩位数（4/6/8）时使用对应的压缩系数，使估算更贴近实际产物。
+    =False）或 fp16 + palettization 折算体积。
+    backend="onnx" / "mlx"：权重先转 fp16（×0.5），若 compressed 再乘以对应量化系数
+    （int8≈0.5、int4≈0.25）。辅助文件（config/tokenizer 等）不进模型。
+    nbits 指定压缩位数（4/6/8）或量化档（"int4"/"int8"）时使用对应系数。
     """
+    if backend in ("onnx", "mlx", "gguf"):
+        weights = sum(f.size for f in scan.files if f.is_weight)
+        factor = FP16_BYTES_FACTOR
+        if compressed:
+            key = nbits if isinstance(nbits, str) else None
+            factor *= _ONNX_QUANT_FACTOR.get(key, PALETTIZE_BYTES_FACTOR) if key else PALETTIZE_BYTES_FACTOR
+        # GGUF 产出单个 .gguf 文件；ONNX/MLX 仍按既有口径估算
+        file_count = 1 if backend == "gguf" else (MLPACKAGE_FILE_COUNT if scan.count else 0)
+        return OutputEstimate(
+            file_count=file_count,
+            total_bytes=int(weights * factor),
+        )
     if backend == "coremltools":
         weights = sum(f.size for f in scan.files if f.is_weight)
         factor = FP16_BYTES_FACTOR

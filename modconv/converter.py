@@ -10,9 +10,9 @@ from __future__ import annotations
 import json
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from modconv.scanner import FileInfo
 from modconv.utils import format_size
@@ -20,6 +20,26 @@ from modconv.utils import format_size
 CHUNK_SIZE = 4 * 1024 * 1024                     # 流式拷贝块大小
 PROGRESS_EMIT_INTERVAL_BYTES = 16 * 1024 * 1024  # 进度回调最小字节间隔
 MANIFEST_NAME = "Manifest.json"
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    """转换后产物的可用性验证结果（转换完成自动执行）。
+
+    - loaded/ran：模型能否用目标原生运行时加载、能否完成一次前向/生成；
+    - passed：是否通过验证（加载+前向正常且能力无额外损失；skipped 时为 False）；
+    - skipped：因依赖缺失/无法构建参考而跳过（非失败，仅未验证）；
+    - metrics：量化损失等数值指标（如 cosine / max_diff / norm_ratio / has_nan）；
+    - summary：面向用户的中文结论。
+    """
+    target: str
+    loaded: bool
+    ran: bool
+    passed: bool
+    skipped: bool
+    metrics: Dict[str, float] = field(default_factory=dict)
+    error: Optional[str] = None
+    summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -31,6 +51,7 @@ class ConversionResult:
     files_done: int
     bytes_done: int
     elapsed_seconds: float
+    verification: Optional[VerificationResult] = None
 
 
 class ConversionHooks:

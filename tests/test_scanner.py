@@ -52,10 +52,15 @@ def test_nonexistent_path_raises(tmp_path):
 
 
 def test_file_path_raises(tmp_path):
+    # 单文件源现在受支持（如 ONNX→GGUF 的 .onnx 源）：返回仅含该文件的 ScanResult
     f = tmp_path / "f.txt"
     f.write_bytes(b"hi")
-    with pytest.raises(NotADirectoryError):
-        scan_directory(f)
+    result = scan_directory(f)
+    assert result.count == 1 and result.files[0].size == 2
+    assert result.files[0].is_weight is False  # .txt 不是权重后缀
+    # 普通文件作为源也不再抛错；仍不存在的路径才抛 FileNotFoundError
+    with pytest.raises(FileNotFoundError):
+        scan_directory(tmp_path / "missing")
 
 
 def test_progress_cb_reported_incrementally(model_dir, monkeypatch):

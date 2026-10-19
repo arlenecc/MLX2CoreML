@@ -188,7 +188,11 @@ def test_start_passes_max_seq_len_to_worker(qtbot, window, model_dir, tmp_path, 
 
 def test_quantize_defaults_to_4bit_and_passes_to_worker(qtbot, window, model_dir,
                                                          tmp_path, monkeypatch):
-    """默认做 4-bit 压缩；切到 fp16 / 6-bit / 8-bit 时向 worker 传对应 bit 数。"""
+    """默认做 4-bit 压缩；切换档位时向 worker 传对应 quant_mode。
+
+    GUI 传 quant_mode 字符串（fp16/4bit/6bit/8bit），由 worker 内部映射为
+    coremltools 的 n-bit 调色板；4-bit 仍是默认档。
+    """
     from unittest.mock import MagicMock
 
     captured = []
@@ -211,20 +215,20 @@ def test_quantize_defaults_to_4bit_and_passes_to_worker(qtbot, window, model_dir
         window._set_running(False)
 
     _click_and_reset()
-    assert captured[-1].get("quantize_nbits") == 4
+    assert captured[-1].get("quant_mode") == "4bit"
 
     # fp16（不压缩）
     window.quant_combo.setCurrentIndex(0)
     _click_and_reset()
-    assert captured[-1].get("quantize_nbits") is None
+    assert captured[-1].get("quant_mode") == "fp16"
 
     # 6-bit / 8-bit
     window.quant_combo.setCurrentIndex(2)
     _click_and_reset()
-    assert captured[-1].get("quantize_nbits") == 6
+    assert captured[-1].get("quant_mode") == "6bit"
     window.quant_combo.setCurrentIndex(3)
     _click_and_reset()
-    assert captured[-1].get("quantize_nbits") == 8
+    assert captured[-1].get("quant_mode") == "8bit"
 
 
 def test_quantize_toggle_updates_estimate(qtbot, window, hf_model_dir, tmp_path):

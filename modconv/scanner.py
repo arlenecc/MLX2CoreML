@@ -10,8 +10,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
 
-# 视作模型权重文件的扩展名（.bin 为 HF 旧的 pytorch_model.bin 权重命名）
-WEIGHT_SUFFIXES = {".safetensors", ".bin", ".npz", ".gguf"}
+from modconv.utils import is_appledouble
+
+# 视作模型权重文件的扩展名（.bin 为 HF 旧的 pytorch_model.bin 权重命名；
+# .onnx 为 ONNX 模型文件，HF→ONNX / ONNX→MLX 任务会产出/消费它）
+WEIGHT_SUFFIXES = {".safetensors", ".bin", ".npz", ".gguf", ".onnx"}
 
 # 扫描进度回调的上报间隔（每处理多少个文件上报一次）
 SCAN_PROGRESS_EVERY = 256
@@ -58,6 +61,10 @@ def scan_directory(
     root = Path(root)
     if not root.exists():
         raise FileNotFoundError(f"目录不存在: {root}")
+    if root.is_file():
+        # 单文件源（如 .onnx）：只统计该文件本身
+        size = root.stat().st_size
+        return ScanResult(source=root, files=[FileInfo(root.name, size, is_weight_file(root.name))])
     if not root.is_dir():
         raise NotADirectoryError(f"不是目录: {root}")
 
@@ -90,6 +97,9 @@ def scan_directory(
                     plain_files.append((entry.name, size))
         except OSError:
             continue  # 目录不可读（权限变化/被移除）：跳过，不让整次扫描失败
+        # 跳过 macOS AppleDouble 伴生文件（._xxx）：写入 exFAT/FAT 外接卷时系统会
+        # 为每个文件生成它们，计入会虚高体积统计并被当作权重文件拷贝。
+        plain_files = [(n, s) for n, s in plain_files if not is_appledouble(n)]
         # 按文件名排序：保证扫描结果与文件系统返回顺序无关（进度、日志可复现）
         plain_files.sort(key=lambda item: item[0])
         for name, size in plain_files:

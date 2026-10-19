@@ -28,3 +28,6 @@ htmlcov/
 # 分发包构建产物（由 packaging/build_macos.py 生成，不入库）
 packaging/icon-preview-512.png
 *.dmg
+
+# SwiftPM 构建产物（examples/swift-gui 等，体积极大，不入库；Package.resolved 除外）
+.build/

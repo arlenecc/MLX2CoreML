@@ -1,41 +1,42 @@
 #!/usr/bin/env bash
-# ModConv Swift GUI 示例构建/运行脚本（macOS，需 Apple Silicon + Core ML）
+# swift-gui 构建/运行脚本（SwiftPM 包，需 macOS 15+ / Apple Silicon）
 #
-# 做了什么：
-#   1) 用系统 swiftc 把 main.swift 编译为 Cocoa 可执行（无 Xcode 也能编，因为只依赖
-#      AppKit/CoreML/Foundation/Combine，不用 SwiftUI 的 @State 等宏）。
-#   2) 打包成 .app，并把 tok_helper.py 一并拷进 Resources，这样运行时不依赖外部路径。
-#   3) 用 open 启动，弹出一个「对话体验」窗口。
+# 支持三后端：CoreML / MLX（mlx-swift-lm）/ ONNX（onnxruntime-swift）；
+# 分词统一用 Swift Tokenizers（swift-transformers），无需 Python 桥接。
+# 依赖首次构建时由 SPM 自动拉取（见 Package.swift）。
 #
-# 使用：
-#   bash build.sh              # 编译并直接打开 .app
-#   bash build.sh --no-open    # 只编译，不打开
-#
-# 自定义模型/分词器（可选，环境变量覆盖）：
-#   MODCONV_TOKENIZER=/path/to/tokenizer.json
-#   MODCONV_MODEL_4BIT8K=/path/to/Qwen3.5-0.8B-xxx.mlpackage
-#   MODCONV_MODEL_6BIT4K=...   MODCONV_MODEL_INT4=...
+# 用法：
+#   bash build.sh            # swift build -c release 并运行（swift run）
+#   bash build.sh --no-run   # 只构建
+#   bash build.sh --app      # 额外打包成 /tmp/ModConvDemo.app 并打开
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP="/tmp/ModConvDemo.app"
-OUT_DIR="$APP/Contents/MacOS"
-RES_DIR="$APP/Contents/Resources"
+cd "$SRC_DIR"
 
-rm -rf "$APP"
-mkdir -p "$OUT_DIR" "$RES_DIR"
+echo "==> swift build -c release ..."
+swift build -c release
+BIN=".build/release/swift-gui"
 
-echo "==> 编译 main.swift ..."
-swiftc -O "$SRC_DIR/main.swift" \
-  -o "$OUT_DIR/gui_app" \
-  -framework AppKit -framework CoreML -framework Foundation -framework Combine
-
-cp "$SRC_DIR/Info.plist" "$APP/Contents/Info.plist"
-cp "$SRC_DIR/tok_helper.py" "$RES_DIR/tok_helper.py"
-
-echo "==> 已构建: $APP"
-
-if [[ "${1:-}" != "--no-open" ]]; then
-  echo "==> 打开应用（首次加载模型约需 1–2 分钟做 ANE 特化）..."
+if [[ "${1:-}" == "--app" ]]; then
+  APP="/tmp/ModConvDemo.app"
+  rm -rf "$APP"
+  mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks"
+  cp "$BIN" "$APP/Contents/MacOS/gui_app"
+  cp "$SRC_DIR/Info.plist" "$APP/Contents/Info.plist"
+  # SPM 动态框架（mlx/onnxruntime 等）一并拷入并加 rpath
+  if [[ -d ".build/release/PackageFrameworks" ]]; then
+    cp -R ".build/release/PackageFrameworks/" "$APP/Contents/Frameworks/"
+  fi
+  # SPM 资源包（MLX 的 Cmlx Metal 着色器、swift-transformers、swift-crypto）；
+  # Bundle.module 会在 Contents/Resources 查找，缺少则 MLX 后端无法初始化。
+  mkdir -p "$APP/Contents/Resources"
+  cp -R .build/release/*.bundle "$APP/Contents/Resources/" 2>/dev/null || true
+  install_name_tool -add_rpath "@executable_path/../Frameworks" \
+    "$APP/Contents/MacOS/gui_app" 2>/dev/null || true
+  echo "==> 已打包: $APP"
   open "$APP"
+elif [[ "${1:-}" != "--no-run" ]]; then
+  echo "==> 运行 swift-gui（首次加载模型约需 1–2 分钟做 ANE 特化）..."
+  swift run swift-gui
 fi
